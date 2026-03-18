@@ -1,0 +1,48 @@
+<?xml version="1.0" ?>
+<Recipe name="Test" version="1.0">
+  <MetaData>
+    <CreatedAt>2026-03-13T14:11:39</CreatedAt>
+    <Description/>
+  </MetaData>
+  <FindWaferEdge>
+    <WaferAlignLeftParam Name="WaferAlign Left Parm">
+      <KernelSize>92</KernelSize>
+      <EdgeThreshold>2374</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>8.9</RansacThreshold>
+    </WaferAlignLeftParam>
+    <WaferAlignRightParam Name="WaferAlign Right Parm">
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignRightParam>
+    <WaferAlignTopParam Name="WaferAlign Top Parm">
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignTopParam>
+    <WaferAlignBotParam Name="WaferAlign Bot Parm">
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignBotParam>
+  </FindWaferEdge>
+  <FindPattern>
+    <MatchThreshold>24.1</MatchThreshold>
+    <NumFeatures>128</NumFeatures>
+    <GradThrPct>70.0</GradThrPct>
+    <TSpread>4</TSpread>
+    <HystKernel>0</HystKernel>
+    <SearchMode>Simple (Fast)</SearchMode>
+    <TemplatePath/>
+    <TemplateCropCX>2300.5</TemplateCropCX>
+    <TemplateCropCY>3482.0</TemplateCropCY>
+  </FindPattern>
+</Recipe>

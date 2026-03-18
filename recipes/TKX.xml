@@ -1,0 +1,49 @@
+<?xml version="1.0" ?>
+<Recipe name="TKX" version="1.0">
+  <MetaData>
+    <CreatedAt>2026-03-13T16:13:05</CreatedAt>
+    <Description/>
+  </MetaData>
+  <FindWaferEdge>
+    <ScanDirection>LEFT</ScanDirection>
+    <LEFT>
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </LEFT>
+    <RIGHT>
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </RIGHT>
+    <TOP>
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </TOP>
+    <BOTTOM>
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </BOTTOM>
+  </FindWaferEdge>
+  <FindPattern>
+    <MatchThreshold>50.0</MatchThreshold>
+    <NumFeatures>128</NumFeatures>
+    <GradThrPct>70.0</GradThrPct>
+    <TSpread>4</TSpread>
+    <HystKernel>0</HystKernel>
+    <SearchMode>Simple (Fast)</SearchMode>
+    <TemplatePath/>
+    <TemplateCropCX>0.0</TemplateCropCX>
+    <TemplateCropCY>0.0</TemplateCropCY>
+  </FindPattern>
+</Recipe>

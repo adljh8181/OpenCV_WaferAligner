@@ -1,0 +1,48 @@
+<?xml version="1.0" ?>
+<Recipe name="TKX3" version="1.0">
+  <MetaData>
+    <CreatedAt>2026-03-16T15:15:18</CreatedAt>
+    <Description/>
+  </MetaData>
+  <FindWaferEdge>
+    <WaferAlignLeftParam Name="WaferAlign Left Parm">
+      <KernelSize>112</KernelSize>
+      <EdgeThreshold>2696</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.050</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignLeftParam>
+    <WaferAlignRightParam Name="WaferAlign Right Parm">
+      <KernelSize>75</KernelSize>
+      <EdgeThreshold>2305</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.050</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignRightParam>
+    <WaferAlignTopParam Name="WaferAlign Top Parm">
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignTopParam>
+    <WaferAlignBotParam Name="WaferAlign Bot Parm">
+      <KernelSize>9</KernelSize>
+      <EdgeThreshold>500</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <RansacThreshold>3.0</RansacThreshold>
+    </WaferAlignBotParam>
+  </FindWaferEdge>
+  <FindPattern>
+    <MatchThreshold>50.0</MatchThreshold>
+    <NumFeatures>128</NumFeatures>
+    <GradThrPct>70.0</GradThrPct>
+    <TSpread>4</TSpread>
+    <HystKernel>0</HystKernel>
+    <SearchMode>Simple (Fast)</SearchMode>
+    <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX3_template.png</TemplatePath>
+    <TemplateCropCX>2300.0</TemplateCropCX>
+    <TemplateCropCY>3490.5</TemplateCropCY>
+  </FindPattern>
+</Recipe>

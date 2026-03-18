@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Change TargetFramework to match your project:
+        net48        → .NET Framework 4.8  (classic WinForms/WPF machine software)
+        net6.0       → .NET 6
+        net8.0       → .NET 8
+
+      PlatformTarget = AnyCPU means the same DLL runs as x86 or x64
+      depending on the host process.  NetMQ is pure managed code so it
+      works without any native DLLs on both 32-bit and 64-bit.
+    -->
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <Nullable>enable</Nullable>
+    <LangVersion>10</LangVersion>
+    <AssemblyName>WaferAlignmentClient</AssemblyName>
+    <RootNamespace>WaferAlignment</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      NetMQ  – pure C# ZeroMQ implementation.
+      No native zmq.dll required → works on x86 and x64 without recompile.
+      https://www.nuget.org/packages/NetMQ
+    -->
+    <PackageReference Include="NetMQ" Version="4.0.1.13" />
+
+    <!--
+      System.Text.Json back-port for .NET Framework 4.x.
+      Remove this if you target .NET 5 / 6 / 7 / 8 (it is built-in).
+    -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>
