@@ -445,14 +445,23 @@ class LinemodMatcher:
     def __init__(self, config=None):
         self.config = config or LinemodConfig()
         self.template_image = None
+        self.detection_mask = None    # User-drawn ROI mask (same size as template, 255=detect)
         self.template_pyramids = []   # List of dicts: angle, scale, templates, image, size
 
-    def load_template(self, template_img):
-        """Load the base template image (grayscale)."""
+    def load_template(self, template_img, detection_mask=None):
+        """Load the base template image (grayscale) and optional detection mask.
+
+        Args:
+            template_img: Template image (grayscale or BGR).
+            detection_mask: Optional binary mask (same size as template,
+                           255=detect region, 0=ignore). When provided,
+                           features will only be extracted from masked area.
+        """
         if len(template_img.shape) == 3:
             self.template_image = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
         else:
             self.template_image = template_img.copy()
+        self.detection_mask = detection_mask.copy() if detection_mask is not None else None
 
     def generate_templates(self):
         """Generate rotated+scaled templates (mirrors shapeInfo.produce_infos)."""
@@ -474,9 +483,18 @@ class LinemodMatcher:
         for scale in scales:
             for angle in angles:
                 src = self._transform(self.template_image, angle, scale)
-                mask_img = self._transform(
+                # Rotation/scale validity mask (non-zero = valid pixel)
+                rotation_mask = self._transform(
                     np.ones_like(self.template_image) * 255, angle, scale)
-                mask_img = (mask_img > 128).astype(np.uint8) * 255
+                rotation_mask = (rotation_mask > 128).astype(np.uint8) * 255
+
+                # Compose with user-drawn detection mask if available
+                if self.detection_mask is not None:
+                    user_mask_xformed = self._transform(self.detection_mask, angle, scale)
+                    user_mask_xformed = (user_mask_xformed > 128).astype(np.uint8) * 255
+                    mask_img = cv2.bitwise_and(rotation_mask, user_mask_xformed)
+                else:
+                    mask_img = rotation_mask
 
                 # Extract features at each pyramid level
                 pyr_src = src.copy()

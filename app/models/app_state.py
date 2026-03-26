@@ -9,6 +9,7 @@ the main window and individual tab classes.
 """
 
 import os
+import numpy as np
 from app.models.recipe_model import RecipeManager, DEFAULT_DIRECTION_PARAMS
 
 
@@ -42,3 +43,5 @@ class AppState:
         self.template_crop_cx: float | None = None
         self.template_crop_cy: float | None = None
         self.template_loaded: bool = False
+        # User-drawn detection mask (same size as cropped template, 255=detect, 0=ignore)
+        self.template_detection_mask: np.ndarray | None = None

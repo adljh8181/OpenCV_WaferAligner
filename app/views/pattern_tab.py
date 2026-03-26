@@ -95,6 +95,19 @@ class PatternTab:
                                             command=self._on_crop_template,
                                             state='disabled')
         self.btn_crop_template.pack(side='left')
+
+        # Detection ROI buttons
+        roi_frame = ttk.Frame(left)
+        roi_frame.pack(anchor='w', fill='x', pady=(2, 5))
+        self.btn_draw_roi = ttk.Button(roi_frame, text="Draw Detection ROI",
+                                       command=self._on_draw_roi,
+                                       state='disabled')
+        self.btn_draw_roi.pack(side='left', padx=(0, 5))
+        self.btn_clear_mask = ttk.Button(roi_frame, text="Clear Mask",
+                                         command=self._on_clear_mask,
+                                         state='disabled')
+        self.btn_clear_mask.pack(side='left')
+
         ttk.Entry(left, textvariable=self.template_img_var, width=50,
                   state='readonly').pack(anchor='w', pady=5)
 
@@ -211,9 +224,15 @@ class PatternTab:
         path = filedialog.askopenfilename()
         if path:
             self.template_img_var.set(path)
-            self._display_image(path, self.lbl_template_img)
             if self.vm.load_template_from_path(path, self._get_tk_vars()):
                 self._log("Template loaded.")
+                self.btn_draw_roi.config(state='normal')
+                self.btn_clear_mask.config(state='normal')
+                # Show mask overlay if one was auto-loaded
+                if self.state.template_detection_mask is not None:
+                    self._display_template_with_mask(path, self.state.template_detection_mask)
+                else:
+                    self._display_image(path, self.lbl_template_img)
 
     def _on_crop_template(self):
         search_path = self.pattern_img_var.get()
@@ -225,6 +244,42 @@ class PatternTab:
         if out_path:
             self.template_img_var.set(out_path)
             self._display_image(out_path, self.lbl_template_img)
+            self.btn_draw_roi.config(state='normal')
+            self.btn_clear_mask.config(state='normal')
+
+    def _on_draw_roi(self):
+        template_path = self.template_img_var.get()
+        if not template_path or not os.path.exists(template_path):
+            messagebox.showwarning("Warning", "Load or crop a template first!")
+            return
+        mask = self.vm.draw_detection_roi(template_path, self._get_tk_vars())
+        if mask is not None:
+            self._display_template_with_mask(template_path, mask)
+
+    def _on_clear_mask(self):
+        template_path = self.template_img_var.get()
+        if not template_path:
+            return
+        self.vm.clear_detection_mask(template_path, self._get_tk_vars())
+        # Refresh template display without mask
+        if os.path.exists(template_path):
+            self._display_image(template_path, self.lbl_template_img)
+
+    def _display_template_with_mask(self, template_path, mask):
+        """Show the template image with a green overlay where the mask is active."""
+        import cv2
+        img = cv2.imread(template_path)
+        if img is None:
+            return
+        overlay = img.copy()
+        overlay[mask > 0] = (
+            overlay[mask > 0].astype(float) * 0.6 +
+            [0, 140, 0]
+        ).clip(0, 255).astype('uint8')
+        # Draw mask contour
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0, 255, 0), max(1, max(img.shape[:2]) // 400))
+        self._display_cv2_image(overlay, self.lbl_template_img)
 
     def _on_find_pattern(self):
         import threading
@@ -289,7 +344,8 @@ class PatternTab:
 
     def enable_buttons(self):
         for btn in [self.btn_detect_pattern, self.btn_load_pattern_search,
-                    self.btn_load_template, self.btn_crop_template]:
+                    self.btn_load_template, self.btn_crop_template,
+                    self.btn_draw_roi, self.btn_clear_mask]:
             btn.config(state='normal')
 
     def _get_tk_vars(self) -> dict:

@@ -36,7 +36,7 @@
   </FindWaferEdge>
   <FindPattern>
     <MatchThreshold>44.7</MatchThreshold>
-    <NumFeatures>477</NumFeatures>
+    <NumFeatures>440</NumFeatures>
     <GradThrPct>90.0</GradThrPct>
     <TSpread>4</TSpread>
     <HystKernel>0</HystKernel>
@@ -44,5 +44,6 @@
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
     <TemplateCropCX>2297.0</TemplateCropCX>
     <TemplateCropCY>3480.0</TemplateCropCY>
+    <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

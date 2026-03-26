@@ -59,6 +59,7 @@ DEFAULT_FIND_PATTERN = {
     "TemplatePath":    "",
     "TemplateCropCX":  "0.0",
     "TemplateCropCY":  "0.0",
+    "DetectionMaskPath": "",
 }
 
 

@@ -225,17 +225,31 @@ class WaferAlignerUI:
         tpath = fp.get("TemplatePath", "")
         if tpath and os.path.exists(tpath):
             pt.template_img_var.set(tpath)
-            self.display_image(tpath, pt.lbl_template_img)
+
+            # Load detection mask if saved with recipe
+            mask_path = fp.get("DetectionMaskPath", "")
+            detection_mask = None
+            if mask_path and os.path.exists(mask_path):
+                detection_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                self.state.template_detection_mask = detection_mask
+                self._log_status(f"Loaded detection mask from recipe: {mask_path}")
+            else:
+                self.state.template_detection_mask = None
+
             img = cv2.imread(tpath, cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                # Only load the raw template image — do NOT generate_templates() here.
-                # Template pyramid (72 variants) is built lazily when the user
-                # clicks "Detect!", so it uses the current slider config.
-                pt.vm.linemod_matcher.load_template(img)
+                pt.vm.linemod_matcher.load_template(img, detection_mask=detection_mask)
                 self.state.template_loaded = True
                 self._log_status(f"Loaded recipe template from {tpath}")
+
+            # Show mask overlay on template display if mask exists
+            if detection_mask is not None:
+                pt._display_template_with_mask(tpath, detection_mask)
+            else:
+                self.display_image(tpath, pt.lbl_template_img)
         else:
             self.state.template_loaded = False
+            self.state.template_detection_mask = None
             pt.lbl_template_img.config(image='')
             pt.template_img_var.set("")
 
@@ -283,6 +297,19 @@ class WaferAlignerUI:
                     shutil.copy2(tpath, dest_path)
                     pt.template_img_var.set(dest_path)
                 fp["TemplatePath"] = dest_path
+
+                # Save detection mask alongside template
+                mask_src = pt.vm._mask_path_for(tpath)
+                mask_dest = os.path.join(recipe_dir, f"{recipe_name}_template_mask.png")
+                if self.state.template_detection_mask is not None:
+                    cv2.imwrite(mask_dest, self.state.template_detection_mask)
+                    fp["DetectionMaskPath"] = mask_dest
+                    self._log_status(f"Detection mask saved to recipe: {mask_dest}")
+                elif os.path.exists(mask_src):
+                    shutil.copy2(mask_src, mask_dest)
+                    fp["DetectionMaskPath"] = mask_dest
+                else:
+                    fp["DetectionMaskPath"] = ""
 
             self.state.recipe_mgr.save(self.state.current_recipe)
             name = self.state.current_recipe['name']

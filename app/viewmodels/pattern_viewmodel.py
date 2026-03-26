@@ -94,6 +94,7 @@ class PatternViewModel:
     def load_template_from_path(self, path: str, tk_vars: dict) -> bool:
         """
         Load a template image from disk and build the template pyramid.
+        Also loads the detection mask if one exists alongside the template.
 
         Returns True on success, False on failure.
         """
@@ -103,11 +104,19 @@ class PatternViewModel:
         if img is None:
             return False
         self.apply_ui_configs(tk_vars)
-        self.linemod_matcher.load_template(img)
+
+        # Check for a saved detection mask alongside the template
+        mask = self._try_load_mask(path)
+        self.state.template_detection_mask = mask
+
+        self.linemod_matcher.load_template(img, detection_mask=mask)
         self.linemod_matcher.generate_templates()
         self._last_template_config_str = self._get_current_config_str()
         self.state.template_loaded = True
-        self._log("Template natively loaded into matcher.")
+        if mask is not None:
+            self._log("Template loaded with detection mask.")
+        else:
+            self._log("Template natively loaded into matcher.")
         return True
 
     def crop_template_from_image(self, search_path: str, tk_vars: dict) -> str | None:
@@ -142,13 +151,11 @@ class PatternViewModel:
             display_img = src
             roi_scale = 1.0
 
-        win_name = "Select template region (ENTER=confirm, C=cancel)"
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win_name, display_img.shape[1], display_img.shape[0])
-        roi = cv2.selectROI(win_name, display_img, fromCenter=False,
-                            showCrosshair=True)
-        cv2.destroyAllWindows()
+        win_name = "Select template region (Drag rect, ENTER=confirm, ESC=cancel)"
+        roi = self._select_roi_safe(display_img, win_name)
 
+        if roi is None:
+            return None
         x, y, w, h = roi
         if w <= 0 or h <= 0:
             return None
@@ -170,7 +177,9 @@ class PatternViewModel:
         img = cv2.imread(out_path, cv2.IMREAD_GRAYSCALE)
         if img is not None:
             self.apply_ui_configs(tk_vars)
-            self.linemod_matcher.load_template(img)
+            # Reset detection mask when a new template is cropped
+            self.state.template_detection_mask = None
+            self.linemod_matcher.load_template(img, detection_mask=None)
             self.linemod_matcher.generate_templates()
             self._last_template_config_str = self._get_current_config_str()
             self.state.template_loaded = True
@@ -181,6 +190,171 @@ class PatternViewModel:
             )
 
         return out_path
+
+    def draw_detection_roi(self, template_path: str, tk_vars: dict) -> np.ndarray | None:
+        """
+        Open the mask editor on the template image so the user can draw a
+        polygon detection region.
+
+        If the user confirms a polygon, the mask is saved to disk alongside
+        the template, stored in AppState, and templates are regenerated.
+
+        Returns the mask (or None if cancelled).
+        """
+        if not template_path or not os.path.exists(template_path):
+            self._log("No template image to draw ROI on.")
+            return None
+
+        template_img = cv2.imread(template_path)
+        if template_img is None:
+            self._log("Failed to read template image.")
+            return None
+
+        from app.views.mask_editor import draw_detection_mask
+        mask = draw_detection_mask(template_img,
+                                   window_title="Draw Detection Region (L-click=add, R-click=close)")
+
+        if mask is None:
+            self._log("ROI drawing cancelled — using full template.")
+            return None
+
+        # Save mask to disk next to the template
+        mask_path = self._mask_path_for(template_path)
+        cv2.imwrite(mask_path, mask)
+        self._log(f"Detection mask saved: {mask_path}")
+
+        # Store in state and rebuild templates
+        self.state.template_detection_mask = mask
+        self.apply_ui_configs(tk_vars)
+        img_gray = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+        self.linemod_matcher.load_template(img_gray, detection_mask=mask)
+        self.linemod_matcher.generate_templates()
+        self._last_template_config_str = self._get_current_config_str()
+        self._log("Templates regenerated with detection mask.")
+        return mask
+
+    def clear_detection_mask(self, template_path: str, tk_vars: dict):
+        """
+        Remove the detection mask and regenerate templates using the full
+        template image.
+        """
+        self.state.template_detection_mask = None
+        mask_path = self._mask_path_for(template_path)
+        if os.path.exists(mask_path):
+            os.remove(mask_path)
+            self._log("Detection mask removed.")
+
+        if template_path and os.path.exists(template_path):
+            self.apply_ui_configs(tk_vars)
+            img_gray = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+            self.linemod_matcher.load_template(img_gray, detection_mask=None)
+            self.linemod_matcher.generate_templates()
+            self._last_template_config_str = self._get_current_config_str()
+            self._log("Templates regenerated without mask (full template).")
+
+    # ------------------------------------------------------------------
+    # Detection mask helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mask_path_for(template_path: str) -> str:
+        """Return the mask PNG path corresponding to a template path."""
+        base, ext = os.path.splitext(template_path)
+        return base + "_mask.png"
+
+    def _try_load_mask(self, template_path: str) -> np.ndarray | None:
+        """Load a detection mask from disk if it exists."""
+        mask_path = self._mask_path_for(template_path)
+        if os.path.exists(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                self._log(f"Loaded detection mask: {mask_path}")
+                return mask
+        return None
+
+    @staticmethod
+    def _select_roi_safe(image, window_title):
+        """
+        Custom rectangle ROI selector that handles the window X button.
+        Returns (x, y, w, h) or None if cancelled.
+        """
+        drawing = False
+        x0 = y0 = x1 = y1 = 0
+        confirmed = False
+        cancelled = False
+
+        def _mouse_cb(event, mx, my, flags, param):
+            nonlocal drawing, x0, y0, x1, y1
+            if event == cv2.EVENT_LBUTTONDOWN:
+                drawing = True
+                x0, y0 = mx, my
+                x1, y1 = mx, my
+            elif event == cv2.EVENT_MOUSEMOVE and drawing:
+                x1, y1 = mx, my
+            elif event == cv2.EVENT_LBUTTONUP:
+                drawing = False
+                x1, y1 = mx, my
+
+        cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(window_title, _mouse_cb)
+
+        while True:
+            vis = image.copy()
+            if x0 != x1 and y0 != y1:
+                rx = min(x0, x1)
+                ry = min(y0, y1)
+                rw = abs(x1 - x0)
+                rh = abs(y1 - y0)
+                cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh),
+                              (0, 255, 0), 2)
+                # Crosshair
+                cx, cy = rx + rw // 2, ry + rh // 2
+                cv2.line(vis, (rx, cy), (rx + rw, cy), (0, 255, 0), 1)
+                cv2.line(vis, (cx, ry), (cx, ry + rh), (0, 255, 0), 1)
+
+            # Instructions
+            h_i, w_i = vis.shape[:2]
+            font_s = max(0.4, 0.5 * (w_i / 1000))
+            cv2.putText(vis, "Drag rect | ENTER: confirm | ESC: cancel",
+                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, font_s,
+                        (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(vis, "Drag rect | ENTER: confirm | ESC: cancel",
+                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, font_s,
+                        (255, 255, 0), 1, cv2.LINE_AA)
+
+            cv2.imshow(window_title, vis)
+            key = cv2.waitKey(16) & 0xFF
+
+            # Detect X button close
+            try:
+                if cv2.getWindowProperty(window_title,
+                                         cv2.WND_PROP_VISIBLE) < 1:
+                    cancelled = True
+                    break
+            except cv2.error:
+                cancelled = True
+                break
+
+            if key == 27:  # Esc
+                cancelled = True
+                break
+            elif key in (13, 10):  # Enter
+                confirmed = True
+                break
+
+        cv2.destroyWindow(window_title)
+        cv2.waitKey(1)
+
+        if cancelled or not confirmed:
+            return None
+
+        rx = min(x0, x1)
+        ry = min(y0, y1)
+        rw = abs(x1 - x0)
+        rh = abs(y1 - y0)
+        if rw <= 0 or rh <= 0:
+            return None
+        return (rx, ry, rw, rh)
 
     # ------------------------------------------------------------------
     # Matching
@@ -358,7 +532,9 @@ class PatternViewModel:
         rmaps     = _compute_response_maps(spread)
         response_combined = np.max(np.stack(rmaps, axis=0), axis=0)
 
-        features    = _extract_scattered_features(q_tmpl, mag_tmpl, num_feats)
+        features    = _extract_scattered_features(
+            q_tmpl, mag_tmpl, num_feats,
+            mask=self.linemod_matcher.detection_mask)
         actual_feats = len(features)
 
         # ── Score map ────────────────────────────────────────────────────
@@ -401,6 +577,22 @@ class PatternViewModel:
 
         feat_dot_r = max(2, min(tmpl_gray.shape[:2]) // 80)
         feat_vis   = cv2.cvtColor(tmpl_gray, cv2.COLOR_GRAY2BGR)
+
+        # Overlay detection mask (green tint) so user can verify features
+        # are only within the painted region
+        det_mask = self.linemod_matcher.detection_mask
+        if det_mask is not None and det_mask.shape == tmpl_gray.shape:
+            mask_overlay = feat_vis.copy()
+            mask_overlay[det_mask > 0] = (
+                mask_overlay[det_mask > 0].astype(float) * 0.5 +
+                [0, 80, 0]
+            ).clip(0, 255).astype('uint8')
+            # Dim region OUTSIDE the mask so it's obvious
+            mask_overlay[det_mask == 0] = (
+                mask_overlay[det_mask == 0].astype(float) * 0.3
+            ).clip(0, 255).astype('uint8')
+            feat_vis = mask_overlay
+
         for f in features:
             color = tuple(int(c) for c in ori_colors[f.label])
             cv2.circle(feat_vis, (f.x, f.y), feat_dot_r, color, -1)
@@ -436,7 +628,8 @@ class PatternViewModel:
         axes[1, 1].imshow(_downsample(response_combined), cmap='hot', vmin=0, vmax=4)
         axes[1, 1].set_title('6. Response Maps', color='red')
         axes[1, 2].imshow(_downsample(cv2.cvtColor(feat_vis, cv2.COLOR_BGR2RGB)))
-        axes[1, 2].set_title(f'7. Extracted ({actual_feats}/{num_feats})',
+        mask_label = " + MASK" if self.linemod_matcher.detection_mask is not None else ""
+        axes[1, 2].set_title(f'7. Extracted ({actual_feats}/{num_feats}){mask_label}',
                              color='green')
 
         if score_map is not None:
