@@ -209,7 +209,7 @@ class InteractiveLinemodTuner:
         self.config.MATCH_THRESHOLD = float(self.sliders['MATCH_THRESHOLD'].val)
         self.config.NUM_FEATURES = int(self.sliders['NUM_FEATURES'].val)
         self.config.WEAK_THRESHOLD = float(self.sliders['WEAK_THRESHOLD'].val)
-        self.config.PYRAMID_LEVELS = 2
+        self.config.PYRAMID_LEVELS = 3
 
         if mode == 'Simple (Fast)':
             self.config.ANGLE_STEP = 360
@@ -398,10 +398,11 @@ class InteractiveLinemodTuner:
             if vy > 0 and vx > 0:
                 score_map = np.zeros((vy, vx), dtype=np.int32)
                 valid = 0
+                rmaps_int32 = [r.astype(np.int32) for r in rmaps]
                 for feat in templ.features:
                     fx, fy = feat.x, feat.y
                     if fy + vy <= sh and fx + vx <= sw and fy >= 0 and fx >= 0:
-                        score_map += rmaps[feat.label][fy:fy+vy, fx:fx+vx].astype(np.int32)
+                        score_map += rmaps_int32[feat.label][fy:fy+vy, fx:fx+vx]
                         valid += 1
                 if valid > 0:
                     score_map = (score_map * 100.0) / (4 * valid)
@@ -430,31 +431,40 @@ class InteractiveLinemodTuner:
         fig.suptitle('LINE-2D Pipeline — Every Phase (%s)' % title_prefix,
                      fontsize=16, fontweight='bold')
 
+        def _downsample(img, max_dim=1024):
+            if img is None: return None
+            h, w = img.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                nh, nw = int(h * scale), int(w * scale)
+                return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_NEAREST)
+            return img
+
         # Row 1: Preprocessing (applies to BOTH training & matching)
-        axes[0,0].imshow(original, cmap='gray')
+        axes[0,0].imshow(_downsample(original), cmap='gray')
         axes[0,0].set_title('1. Input Image\n(Grayscale)', fontsize=11, fontweight='bold', color='navy')
 
-        axes[0,1].imshow(magnitude, cmap='hot')
+        axes[0,1].imshow(_downsample(magnitude), cmap='hot')
         axes[0,1].set_title('2. Gradient Magnitude\n(Sobel)', fontsize=11, fontweight='bold', color='navy')
 
-        axes[0,2].imshow(angle, cmap='hsv', vmin=0, vmax=360)
+        axes[0,2].imshow(_downsample(angle), cmap='hsv', vmin=0, vmax=360)
         axes[0,2].set_title('3. Gradient Angle\n(0\u00b0-360\u00b0)', fontsize=11, fontweight='bold', color='navy')
 
-        axes[0,3].imshow(colorize(quantized))
+        axes[0,3].imshow(_downsample(colorize(quantized)))
         axes[0,3].set_title('4. Quantized (8 bins)\n+ Hysteresis Filter', fontsize=11, fontweight='bold', color='navy')
 
         # Row 2: Matching + Training feature extraction
-        axes[1,0].imshow(colorize(spread))
+        axes[1,0].imshow(_downsample(colorize(spread)))
         axes[1,0].set_title('5. Spread (T=%d)\nOR neighbourhood [Matching]' % T, fontsize=11, fontweight='bold', color='red')
 
-        axes[1,1].imshow(response_combined, cmap='hot', vmin=0, vmax=4)
+        axes[1,1].imshow(_downsample(response_combined), cmap='hot', vmin=0, vmax=4)
         axes[1,1].set_title('6. Response Maps\nPer-Direction Scores [Matching]', fontsize=11, fontweight='bold', color='red')
 
-        axes[1,2].imshow(cv2.cvtColor(feat_vis, cv2.COLOR_BGR2RGB))
+        axes[1,2].imshow(_downsample(cv2.cvtColor(feat_vis, cv2.COLOR_BGR2RGB)))
         axes[1,2].set_title('7. Extracted Features\n(%d/%d points) [Training]' % (actual_feats, num_feats), fontsize=11, fontweight='bold', color='green')
 
         if score_map is not None:
-            im = axes[1,3].imshow(score_map, cmap='jet', vmin=0, vmax=100)
+            im = axes[1,3].imshow(_downsample(score_map), cmap='jet', vmin=0, vmax=100)
             axes[1,3].set_title('8. Score Map\nFeatures × Response [Matching]', fontsize=11, fontweight='bold', color='red')
             plt.colorbar(im, ax=axes[1,3], shrink=0.8)
         else:

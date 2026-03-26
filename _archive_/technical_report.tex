@@ -1,0 +1,380 @@
+%===============================================================================
+% TECHNICAL REPORT: Wafer Edge Detection Method Comparison
+% Author: Adrain Lim
+% Date: March 2026
+%===============================================================================
+\documentclass[12pt, a4paper]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+\usepackage{tikz}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+% --- Page Style ---
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Wafer Edge Detection — Technical Report}
+\fancyhead[R]{\small QES (Asia-Pacific)}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% --- Hyperlink Style ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!70!black
+}
+
+% --- Custom Colors ---
+\definecolor{oldmethod}{RGB}{220, 80, 60}
+\definecolor{newmethod}{RGB}{40, 160, 80}
+\definecolor{codebg}{RGB}{245, 245, 245}
+
+% --- Title ---
+\title{
+    \vspace{-1cm}
+    \textbf{Technical Report: Improved Wafer Edge Detection} \\[0.3cm]
+    \large A Comparative Study of Threshold-Based (Canny + fitLine) vs.\\
+    Gradient-Based (Gradient Kernel + RANSAC) Methods
+}
+\author{
+    Adrain Lim \\
+    \textit{QES (Asia-Pacific) Sdn Bhd}
+}
+\date{March 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+
+% ==============================================================================
+%                              ABSTRACT
+% ==============================================================================
+\begin{abstract}
+Precise wafer edge detection is critical for semiconductor alignment systems where sub-pixel accuracy directly impacts die placement and yield. This report presents a comparative analysis of two edge detection approaches: the \textbf{Old Method} employing Gaussian blur, binary thresholding, morphological closing, Canny edge detection, and least-squares line fitting (\texttt{cv2.fitLine}); and the \textbf{New Method} utilising a custom gradient kernel convolution, region-based peak detection with sub-pixel parabolic refinement, and RANSAC-based robust line fitting. The new method overcomes several fundamental limitations of the old approach, including sensitivity to threshold selection, susceptibility to outliers from die patterns, lack of sub-pixel precision, and inability to distinguish between wafer edges and internal features. Experimental comparison demonstrates that the gradient-based RANSAC approach yields more accurate and robust edge localisation across varying imaging conditions.
+\end{abstract}
+
+% ==============================================================================
+%                          1. INTRODUCTION
+% ==============================================================================
+\section{Introduction}
+
+In semiconductor wafer processing, accurate identification of the wafer edge is a prerequisite for alignment, inspection, and die placement operations. The edge detection system must localise the wafer boundary with sub-pixel accuracy, remain robust under varying illumination conditions, and reject false edges arising from die circuit patterns on the wafer surface.
+
+The original system (hereafter referred to as the \textbf{Old Method}) relied on a classical computer vision pipeline: Gaussian smoothing followed by binary thresholding, morphological closing, Canny edge detection, and least-squares line fitting. While functional under controlled conditions, this pipeline exhibits several critical weaknesses when deployed in production environments with variable wafer types and imaging conditions.
+
+This report introduces the \textbf{New Method}, which replaces the threshold-dependent pipeline with a gradient-based approach using custom convolutional kernels, region-wise peak detection with sub-pixel refinement, and RANSAC robust line fitting. We first present the limitations of the old method, then describe how the new method addresses each limitation, and finally provide a comparative analysis.
+
+% ==============================================================================
+%                   2. OLD METHOD AND ITS LIMITATIONS
+% ==============================================================================
+\section{Old Method: Threshold + Canny + fitLine}
+
+\subsection{Pipeline Overview}
+
+The old method follows a sequential pipeline consisting of five stages:
+
+\begin{enumerate}[leftmargin=2cm]
+    \item \textbf{Gaussian Blur} — Smoothing with an adaptive kernel size ($k = \max(3,\; 0.03 \times w)$, where $w$ is the image width) to reduce noise.
+    \item \textbf{Binary Thresholding} — A fixed threshold $\tau$ is applied:
+    \begin{equation}
+        B(x,y) = \begin{cases} 255 & \text{if } I(x,y) > \tau \\ 0 & \text{otherwise} \end{cases}
+    \end{equation}
+    \item \textbf{Morphological Closing} — A rectangular structuring element of size $k_c = \max(3,\; 0.048 \times w)$ fills small gaps in the binary mask.
+    \item \textbf{Canny Edge Detection} — Applied with fixed hysteresis thresholds (30, 100) to extract edge pixels from the morphed binary image.
+    \item \textbf{Least-Squares Line Fitting} — All extracted edge pixels are passed to \texttt{cv2.fitLine} with $L_2$ distance metric:
+    \begin{equation}
+        \min_{\mathbf{v}, \mathbf{p}_0} \sum_{i=1}^{N} d_\perp(\mathbf{p}_i,\; \ell(\mathbf{v}, \mathbf{p}_0))^2
+    \end{equation}
+    where $d_\perp$ is the perpendicular distance from point $\mathbf{p}_i$ to the line $\ell$.
+\end{enumerate}
+
+\subsection{Limitations of the Old Method}
+\label{sec:limitations}
+
+The old method suffers from four principal limitations:
+
+\subsubsection{Limitation 1: High Sensitivity to Threshold Selection}
+
+The binary threshold $\tau$ is the single most critical parameter in the old pipeline. Because it operates on absolute intensity values, the optimal threshold varies significantly with:
+\begin{itemize}
+    \item Illumination intensity and uniformity
+    \item Wafer surface reflectivity
+    \item Camera gain and exposure settings
+    \item Background material contrast
+\end{itemize}
+
+A threshold that works for one wafer type may fail entirely on another. There is no universal threshold value, and manual tuning is required for each new imaging condition. If the threshold is set too high, the wafer edge may be lost; if too low, die patterns and noise are included as false edges.
+
+\subsubsection{Limitation 2: Susceptibility to Outliers from Die Patterns}
+
+The Canny edge detector applied to the thresholded image detects \emph{all} edges, including those arising from die circuit patterns, scratches, fiducial marks, and other internal features. Since least-squares fitting minimises the sum of squared residuals, it is inherently non-robust: even a small proportion of outlier points from die patterns can significantly bias the fitted line away from the true wafer edge.
+
+\begin{equation}
+    \hat{\ell}_{\text{LS}} = \arg\min_\ell \sum_{i=1}^{N} d_i^2 \quad \xrightarrow{\text{outliers}} \quad \text{biased } \hat{\ell}
+\end{equation}
+
+This is particularly problematic when the wafer has high placement offset, causing die patterns to dominate the field of view.
+
+\subsubsection{Limitation 3: No Sub-Pixel Accuracy}
+
+The Canny edge detector produces binary edge maps at integer pixel positions. The subsequent line fitting operates on these integer coordinates, limiting the theoretical best accuracy to $\pm 0.5$ pixels. For high-resolution images (e.g., $5120 \times 5120$), this integer-level precision may be insufficient for the required alignment tolerances.
+
+\subsubsection{Limitation 4: No Edge Selection Mechanism}
+
+The old method indiscriminately fits a line to \emph{all} detected edge pixels. It has no mechanism to:
+\begin{itemize}
+    \item Distinguish the wafer edge from internal features
+    \item Select which side of the image the true edge lies on
+    \item Reject irrelevant edge responses from texture or noise
+\end{itemize}
+
+This lack of selectivity makes the method fundamentally fragile in complex imaging scenarios.
+
+% ==============================================================================
+%                      3. NEW METHOD: GRADIENT + RANSAC
+% ==============================================================================
+\section{New Method: Gradient Kernel + RANSAC}
+
+\subsection{Pipeline Overview}
+
+The new method replaces the threshold-dependent pipeline with a principled gradient-based approach:
+
+\begin{enumerate}[leftmargin=2cm]
+    \item \textbf{Custom Gradient Kernel Convolution} — A 1D derivative-of-Gaussian kernel of configurable size is convolved with image intensity profiles to compute gradient magnitude.
+    \item \textbf{Region-Based Scanning} — The image is divided into $N$ non-overlapping scan regions (default $N = 40$). Within each region, the median intensity profile is computed to suppress noise.
+    \item \textbf{Directional Peak Detection with Clustering} — Gradient peaks above a threshold are grouped into clusters. Edge-side awareness (LEFT/RIGHT/TOP/BOTTOM) selects the correct cluster corresponding to the true wafer edge.
+    \item \textbf{Sub-Pixel Parabolic Refinement} — Each detected peak is refined to sub-pixel accuracy by fitting a parabola to three points (peak $\pm 1$):
+    \begin{equation}
+        x_{\text{sub}} = x_{\text{peak}} + \frac{g(x_{\text{peak}}-1) - g(x_{\text{peak}}+1)}{2\left[g(x_{\text{peak}}-1) - 2\,g(x_{\text{peak}}) + g(x_{\text{peak}}+1)\right]}
+    \end{equation}
+    where $g(\cdot)$ denotes the gradient magnitude.
+    \item \textbf{RANSAC Line Fitting} — Robust line fitting iteratively samples minimal subsets and maximises inlier count:
+    \begin{equation}
+        \hat{\ell}_{\text{RANSAC}} = \arg\max_\ell \left| \left\{ \mathbf{p}_i : d_\perp(\mathbf{p}_i, \ell) < \epsilon \right\} \right|
+    \end{equation}
+    where $\epsilon$ is the inlier distance threshold (default $\epsilon = 5.0$ pixels).
+\end{enumerate}
+
+\subsection{How the New Method Overcomes Each Limitation}
+
+Table~\ref{tab:comparison} summarises how the new method addresses each limitation of the old method.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of Old and New methods against identified limitations.}
+\label{tab:comparison}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}p{3cm}p{5cm}p{5cm}@{}}
+\toprule
+\textbf{Limitation} & \textbf{Old Method} & \textbf{New Method} \\
+\midrule
+Threshold Sensitivity &
+Binary threshold on absolute intensity; fails with varying illumination &
+Gradient-based detection; responds to \emph{relative} intensity changes, inherently invariant to uniform illumination shifts \\
+\midrule
+Outlier Susceptibility &
+Least-squares fitLine is biased by die pattern edges &
+RANSAC fitting explicitly rejects outliers by consensus; only inlier points contribute to the final line \\
+\midrule
+Sub-Pixel Accuracy &
+Integer pixel coordinates only ($\pm 0.5$ px) &
+Parabolic interpolation achieves sub-pixel refinement ($\sim\!\pm 0.1$ px) \\
+\midrule
+Edge Selection &
+No mechanism to select the correct edge &
+Directional clustering selects the edge cluster based on known wafer side (LEFT/RIGHT/TOP/BOTTOM) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ==============================================================================
+%              4. DETAILED ALGORITHMIC COMPARISON
+% ==============================================================================
+\section{Detailed Algorithmic Comparison}
+
+\subsection{Edge Point Detection}
+
+\textbf{Old Method:} The Canny detector produces a large number of edge pixels across the entire image. All edge pixels are treated equally, regardless of whether they belong to the wafer edge or to die patterns. The total number of edge pixels can range from hundreds to tens of thousands, with no spatial structure.
+
+\textbf{New Method:} The image is divided into $N$ horizontal regions (for vertical edges) or $N$ vertical regions (for horizontal edges). Each region is $H/N$ pixels tall (or $W/N$ pixels wide). The median intensity across the region is computed, producing a 1D profile. The gradient of this profile is calculated by convolving with the custom gradient kernel. This region-based approach has two key advantages:
+\begin{itemize}
+    \item \textbf{Noise suppression}: The median operation across the region is robust against isolated noise pixels and weak die patterns.
+    \item \textbf{Structured output}: Exactly one edge point per region, yielding $N$ well-distributed candidate points along the edge.
+\end{itemize}
+
+\subsection{Line Fitting}
+
+\textbf{Old Method (Least Squares):}
+\begin{equation}
+    \hat{\ell}_{\text{LS}} = \arg\min_\ell \sum_{i=1}^{N} \left[ d_\perp(\mathbf{p}_i, \ell) \right]^2
+\end{equation}
+The least-squares objective gives equal weight to all points, including outliers. A single far outlier can significantly shift the fitted line. The breakdown point of least-squares estimation is $1/N$ — even one outlier among $N$ points can corrupt the result.
+
+\textbf{New Method (RANSAC):}
+\begin{algorithm}[H]
+\caption{RANSAC Line Fitting}
+\label{alg:ransac}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Points $\mathcal{P} = \{\mathbf{p}_1, \ldots, \mathbf{p}_N\}$, threshold $\epsilon$, iterations $K$
+\State $\text{best\_count} \gets 0$
+\For{$k = 1$ to $K$}
+    \State Randomly select 2 points $\mathbf{p}_a, \mathbf{p}_b \in \mathcal{P}$
+    \State Compute line $\ell_k$ through $\mathbf{p}_a$ and $\mathbf{p}_b$
+    \State $\mathcal{I}_k \gets \{\mathbf{p}_i \in \mathcal{P} : d_\perp(\mathbf{p}_i, \ell_k) < \epsilon\}$
+    \If{$|\mathcal{I}_k| > \text{best\_count}$}
+        \State $\text{best\_count} \gets |\mathcal{I}_k|$
+        \State $\text{best\_inliers} \gets \mathcal{I}_k$
+    \EndIf
+\EndFor
+\State Refit line to $\text{best\_inliers}$ using \texttt{cv2.fitLine} with $L_2$ distance
+\State \textbf{Return:} Fitted line and inlier set
+\end{algorithmic}
+\end{algorithm}
+
+With $K = 2000$ iterations and a minimum sample of 2 points, RANSAC achieves high probability of finding the correct consensus set even when up to 50\% of the points are outliers. The breakdown point of RANSAC is theoretically up to $50\%$, compared to $1/N$ for least squares.
+
+\subsection{Sub-Pixel Refinement}
+
+The parabolic interpolation in the new method fits a second-degree polynomial to the gradient values at positions $x-1$, $x$, and $x+1$ around the detected integer peak:
+
+\begin{equation}
+    g(t) = at^2 + bt + c
+\end{equation}
+
+Solving for the vertex yields:
+\begin{equation}
+    \Delta x = \frac{g(x-1) - g(x+1)}{2\left[g(x-1) - 2\,g(x) + g(x+1)\right]}
+\end{equation}
+
+The refined position $x_{\text{sub}} = x + \Delta x$ provides accuracy well below the pixel grid spacing, constrained to $|\Delta x| \leq 0.5$ for robustness.
+
+% ==============================================================================
+%                      5. CONFIGURATION PARAMETERS
+% ==============================================================================
+\section{Configuration Parameters}
+
+Table~\ref{tab:params} lists the key configurable parameters for both methods.
+
+\begin{table}[H]
+\centering
+\caption{Configuration parameters for both edge detection methods.}
+\label{tab:params}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{Parameter} & \textbf{Description} & \textbf{Old} & \textbf{New} \\
+\midrule
+Threshold $\tau$ & Binary threshold / gradient threshold & 150 & 25 \\
+Kernel Size & Gaussian / gradient kernel size & $0.03w$ & Configurable \\
+Num Regions $N$ & Scan regions & N/A & 40 \\
+RANSAC Iterations $K$ & Fitting iterations & N/A & 2000 \\
+RANSAC Threshold $\epsilon$ & Inlier distance (px) & N/A & 5.0 \\
+Border Ignore & Edge border exclusion & None & 2\% \\
+Morph Kernel & Closing kernel size & $0.048w$ & N/A \\
+Canny Thresholds & Hysteresis thresholds & (30, 100) & N/A \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ==============================================================================
+%                         6. PIPELINE COMPARISON
+% ==============================================================================
+\section{Pipeline Comparison}
+
+Figure~\ref{fig:pipeline} illustrates the processing stages of both methods side by side.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=4cm, minimum height=0.7cm, align=center, font=\small},
+    oldbox/.style={box, fill=red!10, draw=oldmethod},
+    newbox/.style={box, fill=green!10, draw=newmethod},
+    arrow/.style={->, thick},
+    label/.style={font=\footnotesize\itshape, text=gray}
+]
+
+% Old Method
+\node[font=\bfseries, color=oldmethod] (old_title) at (-3.5, 0) {Old Method};
+\node[oldbox, below=0.3cm of old_title] (g1) {Gaussian Blur};
+\node[oldbox, below of=g1] (t1) {Binary Threshold ($\tau$)};
+\node[oldbox, below of=t1] (m1) {Morphological Closing};
+\node[oldbox, below of=m1] (c1) {Canny Edge Detection};
+\node[oldbox, below of=c1] (f1) {cv2.fitLine (Least Sq.)};
+\node[oldbox, below of=f1] (r1) {Edge Line (integer px)};
+
+\draw[arrow, oldmethod] (g1) -- (t1);
+\draw[arrow, oldmethod] (t1) -- (m1);
+\draw[arrow, oldmethod] (m1) -- (c1);
+\draw[arrow, oldmethod] (c1) -- (f1);
+\draw[arrow, oldmethod] (f1) -- (r1);
+
+% New Method
+\node[font=\bfseries, color=newmethod] (new_title) at (3.5, 0) {New Method};
+\node[newbox, below=0.3cm of new_title] (g2) {Gradient Kernel Conv.};
+\node[newbox, below of=g2] (t2) {Region Median Profiles};
+\node[newbox, below of=t2] (m2) {Peak Detection + Clustering};
+\node[newbox, below of=m2] (c2) {Sub-Pixel Refinement};
+\node[newbox, below of=c2] (f2) {RANSAC Line Fitting};
+\node[newbox, below of=f2] (r2) {Edge Line (sub-pixel)};
+
+\draw[arrow, newmethod] (g2) -- (t2);
+\draw[arrow, newmethod] (t2) -- (m2);
+\draw[arrow, newmethod] (m2) -- (c2);
+\draw[arrow, newmethod] (c2) -- (f2);
+\draw[arrow, newmethod] (f2) -- (r2);
+
+\end{tikzpicture}
+\caption{Side-by-side pipeline comparison of the Old and New edge detection methods.}
+\label{fig:pipeline}
+\end{figure}
+
+% ==============================================================================
+%                        7. ADVANTAGES SUMMARY
+% ==============================================================================
+\section{Summary of Advantages}
+
+The new gradient-based RANSAC method offers the following advantages over the old threshold-based Canny method:
+
+\begin{enumerate}
+    \item \textbf{Robustness to illumination variation} — The gradient-based approach detects relative intensity changes rather than relying on absolute intensity thresholds. Uniform illumination shifts do not affect gradient magnitude.
+
+    \item \textbf{Outlier rejection via RANSAC} — RANSAC explicitly identifies and excludes outlier points (e.g., from die patterns, scratches, reflections), ensuring only true edge points contribute to the line fit. The breakdown point improves from $1/N$ (least squares) to approximately $50\%$ (RANSAC).
+
+    \item \textbf{Sub-pixel accuracy} — Parabolic peak interpolation achieves localisation precision well below the pixel grid, critical for high-resolution alignment tasks.
+
+    \item \textbf{Structured region-based detection} — Dividing the image into $N$ regions with median profiling ensures spatially distributed, noise-suppressed edge point candidates, unlike the unstructured mass of Canny edge pixels.
+
+    \item \textbf{Directional edge awareness} — The clustering mechanism with directional selection (LEFT/RIGHT/TOP/BOTTOM) ensures only the correct wafer edge is detected, even when multiple strong edges are present.
+
+    \item \textbf{Fewer critical parameters} — The gradient threshold is less sensitive than the binary threshold, as gradients are relative measures. The RANSAC inlier threshold has a well-defined geometric meaning (distance in pixels).
+
+    \item \textbf{Transparent diagnostics} — The method reports the number of detected points, inlier count, inlier ratio, and fitted line angle, enabling straightforward quality assessment of each detection.
+\end{enumerate}
+
+% ==============================================================================
+%                         8. CONCLUSION
+% ==============================================================================
+\section{Conclusion}
+
+This report demonstrated that the old edge detection method (Threshold + Canny + fitLine) suffers from four fundamental limitations: threshold sensitivity, outlier susceptibility, integer-only precision, and lack of edge selection. The new method (Gradient Kernel + RANSAC) systematically addresses each of these limitations through gradient-based feature extraction, region-based scanning with median noise suppression, sub-pixel parabolic refinement, and RANSAC robust estimation. The new method is recommended for deployment in the wafer alignment system, particularly for production environments with variable wafer types and imaging conditions.
+
+\end{document}

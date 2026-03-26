@@ -692,20 +692,15 @@ class EdgeLineFinder:
             angle_str = "N/A"
 
         summary = f"""
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘              EDGE LINE FINDER SUMMARY                     â•‘
-â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
-â•‘  Status:         {"âœ“ SUCCESS" if result['success'] else "âœ— FAILED":<30}   â•‘
-â•‘  FOV Type:       {result.get('fov_type', 'Unknown'):<30}   â•‘
-â•‘                                                           â•‘
-â•‘  Detection:                                               â•‘
-â•‘    Points Found:  {result['num_points']:<28}   â•‘
-â•‘    Inliers:       {result['num_inliers']:<28}   â•‘
-â•‘                                                           â•‘
-â•‘  Line:                                                    â•‘
-â•‘    Endpoints:     {line_str:<28}   â•‘
-â•‘    Angle:         {angle_str:<28}   â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        EDGE LINE FINDER SUMMARY                     
+        Status:         {"âœ“ SUCCESS" if result['success'] else " FAILED":<30}  
+        FOV Type:       {result.get('fov_type', 'Unknown'):<30} 
+        Detection:                                              
+        Points Found:  {result['num_points']:<28}   
+        Inliers:       {result['num_inliers']:<28}  
+        Line:                                                  
+        Endpoints:     {line_str:<28}  
+        Angle:         {angle_str:<28}   
         """
 
         color = 'lightgreen' if result['success'] else 'lightyellow'

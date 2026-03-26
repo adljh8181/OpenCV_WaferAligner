@@ -35,14 +35,14 @@
     </WaferAlignBotParam>
   </FindWaferEdge>
   <FindPattern>
-    <MatchThreshold>50.0</MatchThreshold>
-    <NumFeatures>128</NumFeatures>
-    <GradThrPct>70.0</GradThrPct>
+    <MatchThreshold>44.7</MatchThreshold>
+    <NumFeatures>477</NumFeatures>
+    <GradThrPct>90.0</GradThrPct>
     <TSpread>4</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
-    <TemplateCropCX>2291.5</TemplateCropCX>
-    <TemplateCropCY>3479.5</TemplateCropCY>
+    <TemplateCropCX>2297.0</TemplateCropCX>
+    <TemplateCropCY>3480.0</TemplateCropCY>
   </FindPattern>
 </Recipe>

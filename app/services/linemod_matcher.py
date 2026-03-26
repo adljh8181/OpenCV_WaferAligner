@@ -61,8 +61,8 @@ class LinemodConfig:
         self.HYSTERESIS_KERNEL = 0    # 0=auto, or odd int 3..13
 
         # --- Pyramid ---
-        self.T_PYRAMID = [4, 8]       # Spreading T per level
-        self.PYRAMID_LEVELS = 2       # Number of levels
+        self.T_PYRAMID = [4, 8, 16]       # Spreading T per level
+        self.PYRAMID_LEVELS = 3       # Number of levels
 
         # --- Matching ---
         self.MATCH_THRESHOLD = 50.0   # Similarity 0–100
@@ -114,11 +114,16 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
         gray = src.astype(np.float32)
 
     # Resolution-adaptive pre-blur: thicken thin edges on high-res images
-    # Without this, thin grooves (1-2px wide at 5120×5120) get killed by hysteresis
+    # If a strict kernel size is enforced (e.g. from config), use it for blur as well
+    # to maintain consistency between small templates and large search images.
     h, w = gray.shape
     max_dim = max(h, w)
-    if max_dim > 1500:
-        # Scale blur with resolution: sigma=1 at ~2000px, sigma=3 at ~5120px
+    
+    if kernel_size > 0:
+        if kernel_size >= 3:
+            gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+    elif max_dim > 1500:
+        # Scale blur dynamically ONLY if auto-detect (kernel_size=0) is requested
         sigma = max(1.0, (max_dim - 1000) / 1500.0)
         ksize = int(sigma * 2) * 2 + 1  # Ensure odd kernel size
         gray = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
@@ -365,26 +370,26 @@ def _extract_scattered_features(quantized, magnitude, num_features, mask=None):
 
     # Greedy scattered selection
     features = []
-    distance = 5.0
+    
+    # Dynamically scale initial distance based on the object's estimated perimeter
+    span_x = np.max(xs) - np.min(xs)
+    span_y = np.max(ys) - np.min(ys)
+    perimeter_approx = 2.0 * (span_x + span_y)
+    distance = max(5.0, perimeter_approx / (num_features * 0.8))  # Slightly optimistic start
 
-    while len(features) < num_features and distance >= 1.0:
+    while distance >= 1.0:
+        features = []  # CRITICAL: Restart collection for the new distance threshold
         dist_sq = distance * distance
+        
         for idx in order:
             x, y, label = int(xs[idx]), int(ys[idx]), int(labels[idx])
-
-            # Check not already selected
-            dup = False
-            for f in features:
-                if f.x == x and f.y == y:
-                    dup = True; break
-            if dup:
-                continue
 
             # Check minimum distance to existing features
             keep = True
             for f in features:
                 if (x - f.x)**2 + (y - f.y)**2 < dist_sq:
                     keep = False; break
+                    
             if keep:
                 features.append(Feature(x, y, label))
                 if len(features) >= num_features:
@@ -392,7 +397,10 @@ def _extract_scattered_features(quantized, magnitude, num_features, mask=None):
 
         if len(features) >= num_features:
             break
-        distance -= 1.0  # Relax and retry
+            
+        # Fast relaxation for large starting distances
+        step = max(1.0, distance * 0.15)
+        distance -= step
 
     return features
 
@@ -599,6 +607,9 @@ class LinemodMatcher:
             kernel_size=cfg.HYSTERESIS_KERNEL)
         spread_q = _spread(quantized, T)
         rmaps = _compute_response_maps(spread_q)
+        # Pre-cast response maps to int32 once to avoid massive memory allocations in the inner loop
+        rmaps_int32 = [r.astype(np.int32) for r in rmaps]
+        
         sh, sw = search_gray.shape[:2]
 
         for tp_idx, tp in enumerate(self.template_pyramids):
@@ -625,7 +636,7 @@ class LinemodMatcher:
                 y_end = fy + vy
                 x_end = fx + vx
                 if y_end <= sh and x_end <= sw and fy >= 0 and fx >= 0:
-                    score_map += rmaps[feat.label][fy:y_end, fx:x_end].astype(np.int32)
+                    score_map += rmaps_int32[feat.label][fy:y_end, fx:x_end]
                     valid_feats += 1
 
             if valid_feats == 0:
@@ -680,54 +691,62 @@ class LinemodMatcher:
             candidate at full resolution for precise positioning.
         """
         import time
+        import math
         cfg = self.config
         sh, sw = search_gray.shape[:2]
 
-        # ---- Level 1: Coarse search at half resolution ----
-        t0 = time.time()
-        search_half = cv2.pyrDown(search_gray)
-        sh1, sw1 = search_half.shape[:2]
+        # Determine optimal coarse level (1/2, 1/4, 1/8 size)
+        max_dim = max(sh, sw)
+        ideal_level = int(max(1, round(math.log2(max_dim / 1200.0))))
+        coarse_level = min(cfg.PYRAMID_LEVELS - 1, ideal_level)
+        coarse_level = max(1, coarse_level) # Ensure at least 1
 
-        T1 = cfg.T_PYRAMID[1] if len(cfg.T_PYRAMID) > 1 else cfg.T_PYRAMID[0]
-        # Use full quantization (with hysteresis) for both coarse and fine.
-        # fast_mode=True was tried but causes feature mismatch: templates are
-        # built with hysteresis, so searching without it misses low-contrast
-        # images (edge not clearly defined). Full quantize adds ~1s on 2560px
-        # but restores detection reliability on all image qualities.
-        q1, _ = _quantize_gradients(search_half, cfg.WEAK_THRESHOLD,
+        if getattr(cfg, "FORCE_COARSE_LEVEL", None) is not None:
+            coarse_level = min(cfg.PYRAMID_LEVELS - 1, max(0, cfg.FORCE_COARSE_LEVEL))
+
+        # ---- Level N: Coarse search at reduced resolution ----
+        t0 = time.time()
+        search_coarse = search_gray
+        for _ in range(coarse_level):
+            search_coarse = cv2.pyrDown(search_coarse)
+        sh_c, sw_c = search_coarse.shape[:2]
+
+        T_c = cfg.T_PYRAMID[coarse_level] if len(cfg.T_PYRAMID) > coarse_level else cfg.T_PYRAMID[-1]
+        
+        q_c, _ = _quantize_gradients(search_coarse, cfg.WEAK_THRESHOLD,
                                     kernel_size=cfg.HYSTERESIS_KERNEL)
-        s1 = _spread(q1, T1)
-        rmaps1 = _compute_response_maps(s1)
+        s_c = _spread(q_c, T_c)
+        rmaps_c = _compute_response_maps(s_c)
+        rmaps_c_int32 = [r.astype(np.int32) for r in rmaps_c]
 
         # Lower threshold for coarse pass — be generous to not miss candidates.
-        # 30% is more forgiving than 50% for unclear images.
         coarse_threshold = max(threshold * 0.3, 15.0)
 
         coarse_candidates = []  # (tp_idx, cx_full, cy_full, coarse_score)
 
         for tp_idx, tp in enumerate(self.template_pyramids):
-            if len(tp['templates']) < 2:
-                continue  # No level-1 template, skip pyramid path
+            if len(tp['templates']) <= coarse_level:
+                continue
 
-            templ1 = tp['templates'][1]  # Level 1 (half-res) template
-            n_feats = len(templ1.features)
+            templ_c = tp['templates'][coarse_level]
+            n_feats = len(templ_c.features)
             if n_feats == 0:
                 continue
 
-            tw1 = templ1.width
-            th1 = templ1.height
-            vy1 = sh1 - th1
-            vx1 = sw1 - tw1
-            if vy1 <= 0 or vx1 <= 0:
+            tw_c = templ_c.width
+            th_c = templ_c.height
+            vy_c = sh_c - th_c
+            vx_c = sw_c - tw_c
+            if vy_c <= 0 or vx_c <= 0:
                 continue
 
             # Score at coarse level
-            score_map = np.zeros((vy1, vx1), dtype=np.int32)
+            score_map = np.zeros((vy_c, vx_c), dtype=np.int32)
             valid = 0
-            for feat in templ1.features:
+            for feat in templ_c.features:
                 fx, fy = feat.x, feat.y
-                if fy + vy1 <= sh1 and fx + vx1 <= sw1 and fy >= 0 and fx >= 0:
-                    score_map += rmaps1[feat.label][fy:fy+vy1, fx:fx+vx1].astype(np.int32)
+                if fy + vy_c <= sh_c and fx + vx_c <= sw_c and fy >= 0 and fx >= 0:
+                    score_map += rmaps_c_int32[feat.label][fy:fy+vy_c, fx:fx+vx_c]
                     valid += 1
 
             if valid == 0:
@@ -746,12 +765,14 @@ class LinemodMatcher:
             kept_coarse = []
             img_w, img_h = tp['size']
 
+            scale_factor = 2 ** coarse_level
+
             for idx in order:
                 # Convert coarse position → full-resolution coordinates
-                cx_half = int(xs[idx]) - templ1.tl_x + img_w // 4
-                cy_half = int(ys[idx]) - templ1.tl_y + img_h // 4
-                cx_full = cx_half * 2
-                cy_full = cy_half * 2
+                cx_c = int(xs[idx]) - templ_c.tl_x + img_w // (2 * scale_factor)
+                cy_c = int(ys[idx]) - templ_c.tl_y + img_h // (2 * scale_factor)
+                cx_full = cx_c * scale_factor
+                cy_full = cy_c * scale_factor
 
                 dup = False
                 for kc in kept_coarse:
@@ -759,26 +780,27 @@ class LinemodMatcher:
                         dup = True; break
                 if not dup:
                     kept_coarse.append((tp_idx, cx_full, cy_full, float(scores[idx])))
-                    if len(kept_coarse) >= 1:   # best candidate only
+                    if len(kept_coarse) >= 1:   # best candidate only per template mode
                         break
 
             coarse_candidates.extend(kept_coarse)
 
         t_coarse = (time.time() - t0) * 1000
-        print(f"  [Pyramid] Coarse (L1 {sw1}×{sh1}): {len(coarse_candidates)} candidates in {t_coarse:.0f}ms")
+        print(f"  [Pyramid] Coarse (L{coarse_level} {sw_c}×{sh_c}): {len(coarse_candidates)} candidates in {t_coarse:.0f}ms")
 
         if not coarse_candidates:
             return []
 
         # ---- Level 0: Fine search in ROI windows ----
-        # Key optimization: quantize/spread/response ONLY the ROI region.
-        # ROI is anchored on the expected template feature-bbox top-left with
-        # a small search_margin (full-res pixels) for coarse inaccuracy.
-        # Coarse at half-res is accurate to ~4 full-res px; 128px is generous.
         t0 = time.time()
         T0 = cfg.T_PYRAMID[0]
-        search_margin = 384  # full-res px — tolerates coarse inaccuracy up to
-                             # 384px while keeping ROI <<< full image size
+        # Auto-scale spread for high-res fine search regions
+        if max_dim > 1500:
+            T0 = max(T0, int(T0 * max_dim / 1500))
+
+        # Margin scaling based on maximum expected coarse spatial drift 
+        # (e.g., 8-12 pixels of drift in coarse space scaled upward)
+        search_margin = 12 * scale_factor 
 
         all_matches = []
 
@@ -817,6 +839,7 @@ class LinemodMatcher:
             q_roi, _ = _quantize_gradients(roi_crop, cfg.WEAK_THRESHOLD)
             s_roi = _spread(q_roi, T0)
             rmaps_roi = _compute_response_maps(s_roi)
+            rmaps_roi_int32 = [r.astype(np.int32) for r in rmaps_roi]
 
             # Valid scan area within ROI
             vy = rh - th0
@@ -831,7 +854,7 @@ class LinemodMatcher:
             for feat in templ0.features:
                 fx, fy = feat.x, feat.y
                 if fy + vy <= rh and fx + vx <= rw and fy >= 0 and fx >= 0:
-                    score_map += rmaps_roi[feat.label][fy:fy+vy, fx:fx+vx].astype(np.int32)
+                    score_map += rmaps_roi_int32[feat.label][fy:fy+vy, fx:fx+vx]
                     valid += 1
 
             if valid == 0:
@@ -929,8 +952,8 @@ class LinemodMatcher:
             colors = [(0,0,255),(0,170,255),(0,255,170),(0,255,0),
                       (170,255,0),(255,170,0),(255,0,0),(255,0,170)]
             for feat in templ.features:
-                fx = bx + int(feat.x * feat_scale_x)
-                fy = by + int(feat.y * feat_scale_y)
+                fx = bx + int((feat.x + templ.tl_x) * feat_scale_x)
+                fy = by + int((feat.y + templ.tl_y) * feat_scale_y)
                 cv2.circle(vis, (fx, fy), dot_r, colors[feat.label % 8], -1)
 
         info = (f"Score:{match_result['score']:.1f}%  "

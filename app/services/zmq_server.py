@@ -461,7 +461,8 @@ class WaferAlignmentServer:
             if "GradThrPct" in fp:     m_cfg.WEAK_THRESHOLD = -float(fp["GradThrPct"])
             if "TSpread" in fp:
                 t = int(fp["TSpread"])
-                m_cfg.T_PYRAMID = [t, t*2]
+                m_cfg.T_PYRAMID = [t, t*2, t*4]
+                m_cfg.PYRAMID_LEVELS = 3
             if "HystKernel" in fp:     m_cfg.HYSTERESIS_KERNEL = int(fp["HystKernel"])
             
             mode = fp.get("SearchMode", "Simple (Fast)")

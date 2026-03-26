@@ -40,6 +40,14 @@ class PatternViewModel:
 
         # Algorithm instance (one per ViewModel, reused across calls)
         self.linemod_matcher = LinemodMatcher(LinemodConfig())
+        
+        # Smart verification to prevent duplicate template generation
+        self._last_template_config_str = None
+
+    def _get_current_config_str(self):
+        """Returns a string representation of the current config settings"""
+        cfg = self.linemod_matcher.config
+        return f"{cfg.NUM_FEATURES}_{cfg.WEAK_THRESHOLD}_{cfg.T_PYRAMID}_{cfg.HYSTERESIS_KERNEL}_{cfg.ANGLE_STEP}_{cfg.SCALE_MIN}_{cfg.SCALE_MAX}"
 
     # ------------------------------------------------------------------
     # Config
@@ -62,9 +70,9 @@ class PatternViewModel:
             cfg.NUM_FEATURES     = int(tk_vars['pattern_num_var'].get())
             cfg.WEAK_THRESHOLD   = -float(tk_vars['pattern_weak_var'].get())
             t_spread = int(tk_vars['pattern_tspread_var'].get())
-            cfg.T_PYRAMID        = [t_spread, t_spread * 2]
+            cfg.T_PYRAMID        = [t_spread, t_spread * 2, t_spread * 4]
             cfg.HYSTERESIS_KERNEL = int(tk_vars['pattern_hyst_var'].get())
-            cfg.PYRAMID_LEVELS   = 2
+            cfg.PYRAMID_LEVELS   = 3
 
             if mode == 'Simple (Fast)':
                 cfg.ANGLE_STEP  = 360
@@ -97,6 +105,7 @@ class PatternViewModel:
         self.apply_ui_configs(tk_vars)
         self.linemod_matcher.load_template(img)
         self.linemod_matcher.generate_templates()
+        self._last_template_config_str = self._get_current_config_str()
         self.state.template_loaded = True
         self._log("Template natively loaded into matcher.")
         return True
@@ -163,6 +172,7 @@ class PatternViewModel:
             self.apply_ui_configs(tk_vars)
             self.linemod_matcher.load_template(img)
             self.linemod_matcher.generate_templates()
+            self._last_template_config_str = self._get_current_config_str()
             self.state.template_loaded = True
             self._log(
                 f"Cropped template loaded. Trained centre: "
@@ -191,15 +201,17 @@ class PatternViewModel:
         if not self.state.template_loaded:
             return None, None
 
-        # Apply latest slider values to config (but skip template rebuild —
-        # templates are already generated when the user loaded/cropped them).
+        # Apply latest slider values to config
         self.apply_ui_configs(tk_vars)
 
-        # Lazy build: if templates were never generated (e.g. recipe was loaded
-        # but the user hasn't clicked Detect yet), build them now.
-        if not self.linemod_matcher.template_pyramids:
-            self._log("[Pattern] Building templates (first run after recipe load)…")
+        # Smart Verification: Only generate templates if config has changed
+        current_config_str = self._get_current_config_str()
+        if self._last_template_config_str != current_config_str:
+            self._log("[Pattern] Settings changed. Re-building templates...")
             self.linemod_matcher.generate_templates()
+            self._last_template_config_str = current_config_str
+        else:
+            self._log("[Pattern] Using existing cached templates (settings unchanged).")
 
         img       = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         orig_color = cv2.imread(path)
@@ -363,12 +375,15 @@ class PatternViewModel:
             if vy > 0 and vx > 0:
                 score_map = np.zeros((vy, vx), dtype=np.int32)
                 valid = 0
+                
+                # Pre-cast response maps to int32 once to avoid massive memory allocations in the loop
+                rmaps_int32 = [r.astype(np.int32) for r in rmaps]
+                
                 for feat in templ.features:
                     fx, fy = feat.x, feat.y
                     if (fy + vy <= sh_i and fx + vx <= sw_i
                             and fy >= 0 and fx >= 0):
-                        score_map += rmaps[feat.label][fy:fy+vy,
-                                                       fx:fx+vx].astype(np.int32)
+                        score_map += rmaps_int32[feat.label][fy:fy+vy, fx:fx+vx]
                         valid += 1
                 if valid > 0:
                     score_map = (score_map * 100.0) / (4 * valid)
@@ -396,25 +411,36 @@ class PatternViewModel:
         fig.suptitle(f'LINE-2D Pipeline — Every Phase ({title_prefix})',
                      fontsize=16, fontweight='bold')
 
-        axes[0, 0].imshow(original, cmap='gray')
+        # Helper to avoid Matplotlib memory crashes (ArrayMemoryError) on hi-res sensor images
+        def _downsample(img, max_dim=1024):
+            if img is None: return None
+            h, w = img.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                nh, nw = int(h * scale), int(w * scale)
+                # Use nearest neighbor to preserve distinct labels/colors without blurring
+                return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_NEAREST)
+            return img
+
+        axes[0, 0].imshow(_downsample(original), cmap='gray')
         axes[0, 0].set_title('1. Input', color='navy')
-        axes[0, 1].imshow(magnitude, cmap='hot')
+        axes[0, 1].imshow(_downsample(magnitude), cmap='hot')
         axes[0, 1].set_title('2. Gradient Magnitude', color='navy')
-        axes[0, 2].imshow(angle, cmap='hsv', vmin=0, vmax=360)
+        axes[0, 2].imshow(_downsample(angle), cmap='hsv', vmin=0, vmax=360)
         axes[0, 2].set_title('3. Gradient Angle', color='navy')
-        axes[0, 3].imshow(colorize(quantized))
+        axes[0, 3].imshow(_downsample(colorize(quantized)))
         axes[0, 3].set_title('4. Quantized (+Hysteresis)', color='navy')
 
-        axes[1, 0].imshow(colorize(spread))
+        axes[1, 0].imshow(_downsample(colorize(spread)))
         axes[1, 0].set_title(f'5. Spread (T={T})', color='red')
-        axes[1, 1].imshow(response_combined, cmap='hot', vmin=0, vmax=4)
+        axes[1, 1].imshow(_downsample(response_combined), cmap='hot', vmin=0, vmax=4)
         axes[1, 1].set_title('6. Response Maps', color='red')
-        axes[1, 2].imshow(cv2.cvtColor(feat_vis, cv2.COLOR_BGR2RGB))
+        axes[1, 2].imshow(_downsample(cv2.cvtColor(feat_vis, cv2.COLOR_BGR2RGB)))
         axes[1, 2].set_title(f'7. Extracted ({actual_feats}/{num_feats})',
                              color='green')
 
         if score_map is not None:
-            im = axes[1, 3].imshow(score_map, cmap='jet', vmin=0, vmax=100)
+            im = axes[1, 3].imshow(_downsample(score_map), cmap='jet', vmin=0, vmax=100)
             axes[1, 3].set_title('8. Score Map', color='red')
             plt.colorbar(im, ax=axes[1, 3], shrink=0.8)
         else:
