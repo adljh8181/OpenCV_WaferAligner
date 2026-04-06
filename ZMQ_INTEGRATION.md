@@ -109,6 +109,54 @@ Runs alignment on a live camera image.
 | `angle` | float  | Rotation in degrees (+ = CCW)            |
 | `score` | float  | Match confidence 0 – 100                 |
 
+### TEACH_REQ  *(interactive – opens OpenCV windows on the Python machine)*
+Triggers the full interactive template-teaching workflow.  Python opens two
+OpenCV windows sequentially on the machine running `zmq_server.py`:
+
+1. **Crop window** – the operator drags a rectangle over the reference pattern
+   on the source image and clicks **Save**.
+2. **Mask window** – the operator left-clicks to add polygon vertices around
+   the exact region to detect, right-clicks to close the polygon, then clicks
+   **Save**.  Closing the window without saving skips mask creation (full
+   template is used).
+
+After both windows are closed the server saves the PNG files, updates the
+recipe XML, and **immediately reloads the matcher** so subsequent `MATCH`
+commands use the new template without a restart.
+
+```
+// Request  (space-separated, paths MUST be quoted if they contain spaces)
+TEACH_REQ "<image_path>" "<recipe_path>"
+
+// Response – operator confirmed crop (mask is optional)
+{
+  "status":        "ok",
+  "template_path": "C:\\recipes\\MyRecipe\\template_1712345678000.png",
+  "mask_path":     "C:\\recipes\\MyRecipe\\template_1712345678000_mask.png",
+  "crop_cx":       512.0,
+  "crop_cy":       310.0
+}
+
+// Response – operator pressed Close / ESC on the crop window
+{ "status": "cancelled" }
+
+// Response – file/recipe error
+{ "status": "error", "message": "..." }
+```
+
+| Field           | Type   | Description                                         |
+|-----------------|--------|-----------------------------------------------------|
+| `template_path` | string | Absolute path to the saved template PNG             |
+| `mask_path`     | string | Absolute path to the mask PNG; **empty string** if no mask was drawn |
+| `crop_cx`       | float  | X centre of the crop in the original image (pixels) |
+| `crop_cy`       | float  | Y centre of the crop in the original image (pixels) |
+
+> **Important**: `TEACH_REQ` blocks the ZMQ server until the operator
+> finishes (or cancels) both interactive windows.  Your C# timeout for this
+> command should be generous (e.g. 5 minutes).
+
+---
+
 ### SHUTDOWN
 Asks the server to exit cleanly.
 ```json

@@ -112,6 +112,9 @@ class WaferAlignerUI:
         self.tab_edge    = self.edge_tab.tab
         self.tab_pattern = self.pattern_tab.tab
 
+        # Auto-start the ZMQ server after UI is fully initialized
+        self.root.after(500, self.zmq_tab.on_start_server)
+
     # ------------------------------------------------------------------
     # Shared display / log helpers
     # ------------------------------------------------------------------
@@ -203,17 +206,20 @@ class WaferAlignerUI:
             self.edge_tab.update_sliders_from_cache(
                 self.edge_tab.edge_dir_var.get())
             self.state.last_edge_dir = self.edge_tab.edge_dir_var.get()
+
+            univ = recipe.get("use_universal_edge_params", False)
+            self.edge_tab.edge_universal_var.set(univ)
         finally:
             self.state._is_loading_recipe = False
 
         # ── Pattern config ───────────────────────────────────────────────
         fp = recipe.get("find_pattern", {})
         pt = self.pattern_tab
-        if "MatchThreshold" in fp: pt.pattern_thresh_var.set(fp["MatchThreshold"])
-        if "NumFeatures"    in fp: pt.pattern_num_var.set(fp["NumFeatures"])
-        if "GradThrPct"     in fp: pt.pattern_weak_var.set(fp["GradThrPct"])
-        if "TSpread"        in fp: pt.pattern_tspread_var.set(fp["TSpread"])
-        if "HystKernel"     in fp: pt.pattern_hyst_var.set(fp["HystKernel"])
+        if "MatchThreshold" in fp: pt.set_slider_value(pt.pattern_thresh_var, fp["MatchThreshold"])
+        if "NumFeatures"    in fp: pt.set_slider_value(pt.pattern_num_var, fp["NumFeatures"])
+        if "GradThrPct"     in fp: pt.set_slider_value(pt.pattern_weak_var, fp["GradThrPct"])
+        if "TSpread"        in fp: pt.set_slider_value(pt.pattern_tspread_var, fp["TSpread"])
+        if "HystKernel"     in fp: pt.set_slider_value(pt.pattern_hyst_var, fp["HystKernel"])
         if "SearchMode"     in fp: pt.pattern_mode_var.set(fp["SearchMode"])
 
         cx = float(fp.get("TemplateCropCX", 0.0))
@@ -273,6 +279,13 @@ class WaferAlignerUI:
             self.state.edge_configs[active_dir]["NumRegions"]       = et.edge_regions_var.get()
             self.state.edge_configs[active_dir]["BorderIgnorePct"]  = et.edge_border_var.get()
             self.state.edge_configs[active_dir]["RansacThreshold"]  = et.edge_ransac_var.get()
+
+            if et.edge_universal_var.get():
+                for d in ["LEFT", "RIGHT", "TOP", "BOTTOM"]:
+                    if d != active_dir:
+                        self.state.edge_configs[d] = self.state.edge_configs[active_dir].copy()
+                        
+            self.state.current_recipe["use_universal_edge_params"] = et.edge_universal_var.get()
 
             fe = self.state.current_recipe.setdefault("find_edge", {})
             for d in ["LEFT", "RIGHT", "TOP", "BOTTOM"]:

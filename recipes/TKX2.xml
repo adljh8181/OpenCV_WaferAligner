@@ -5,45 +5,46 @@
     <Description/>
   </MetaData>
   <FindWaferEdge>
+    <UseUniversalParams>True</UseUniversalParams>
     <WaferAlignLeftParam Name="WaferAlign Left Parm">
-      <KernelSize>98</KernelSize>
-      <EdgeThreshold>500</EdgeThreshold>
+      <KernelSize>120</KernelSize>
+      <EdgeThreshold>4724</EdgeThreshold>
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
     </WaferAlignLeftParam>
     <WaferAlignRightParam Name="WaferAlign Right Parm">
-      <KernelSize>9</KernelSize>
-      <EdgeThreshold>500</EdgeThreshold>
-      <NumRegions>5</NumRegions>
+      <KernelSize>120</KernelSize>
+      <EdgeThreshold>4724</EdgeThreshold>
+      <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
     </WaferAlignRightParam>
     <WaferAlignTopParam Name="WaferAlign Top Parm">
-      <KernelSize>9</KernelSize>
-      <EdgeThreshold>500</EdgeThreshold>
+      <KernelSize>120</KernelSize>
+      <EdgeThreshold>4724</EdgeThreshold>
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
-      <RansacThreshold>20.0</RansacThreshold>
+      <RansacThreshold>3.0</RansacThreshold>
     </WaferAlignTopParam>
     <WaferAlignBotParam Name="WaferAlign Bot Parm">
-      <KernelSize>9</KernelSize>
-      <EdgeThreshold>500</EdgeThreshold>
-      <NumRegions>53</NumRegions>
-      <BorderIgnorePct>0.008</BorderIgnorePct>
+      <KernelSize>120</KernelSize>
+      <EdgeThreshold>4724</EdgeThreshold>
+      <NumRegions>30</NumRegions>
+      <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
     </WaferAlignBotParam>
   </FindWaferEdge>
   <FindPattern>
-    <MatchThreshold>44.7</MatchThreshold>
+    <MatchThreshold>48.2</MatchThreshold>
     <NumFeatures>440</NumFeatures>
     <GradThrPct>90.0</GradThrPct>
     <TSpread>4</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
-    <TemplateCropCX>2297.0</TemplateCropCX>
-    <TemplateCropCY>3480.0</TemplateCropCY>
+    <TemplateCropCX>2294.5</TemplateCropCX>
+    <TemplateCropCY>3477.0</TemplateCropCY>
     <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

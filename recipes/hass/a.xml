@@ -1,16 +1,15 @@
 <?xml version="1.0" ?>
-<Recipe name="ADLIM" version="1.0">
+<Recipe name="a" version="1.0">
   <MetaData>
-    <CreatedAt>2026-03-17T17:19:35</CreatedAt>
+    <CreatedAt>2026-03-31T09:21:32</CreatedAt>
     <Description/>
   </MetaData>
   <FindWaferEdge>
-    <UseUniversalParams>False</UseUniversalParams>
     <WaferAlignLeftParam Name="WaferAlign Left Parm">
       <KernelSize>9</KernelSize>
       <EdgeThreshold>500</EdgeThreshold>
       <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.050</BorderIgnorePct>
+      <BorderIgnorePct>0.05</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
     </WaferAlignLeftParam>
     <WaferAlignRightParam Name="WaferAlign Right Parm">
@@ -42,9 +41,9 @@
     <TSpread>4</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
-    <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\ADLIM_template.png</TemplatePath>
-    <TemplateCropCX>955.5</TemplateCropCX>
-    <TemplateCropCY>632.5</TemplateCropCY>
-    <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\ADLIM_template_mask.png</DetectionMaskPath>
+    <TemplatePath/>
+    <TemplateCropCX>0.0</TemplateCropCX>
+    <TemplateCropCY>0.0</TemplateCropCY>
+    <DetectionMaskPath/>
   </FindPattern>
 </Recipe>

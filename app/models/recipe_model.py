@@ -197,12 +197,16 @@ class RecipeManager:
             edge_params[dir_name] = d_params
         patt_params = {k: _get("FindPattern",   k, v) for k, v in DEFAULT_FIND_PATTERN.items()}
 
+        univ_el = root.find("FindWaferEdge/UseUniversalParams")
+        use_univ = (univ_el.text.lower() == 'true') if univ_el is not None and univ_el.text else False
+
         return {
             "name":         root.get("name", os.path.splitext(os.path.basename(path))[0]),
             "path":         path,
             "meta":         {"created_at": created, "description": desc},
             "find_edge":    edge_params,
             "find_pattern": patt_params,
+            "use_universal_edge_params": use_univ,
         }
 
     def save(self, recipe: dict):
@@ -218,6 +222,7 @@ class RecipeManager:
         ET.SubElement(meta, "Description").text = meta_d.get("description", "")
 
         edge_el = ET.SubElement(root, "FindWaferEdge")
+        ET.SubElement(edge_el, "UseUniversalParams").text = str(recipe.get("use_universal_edge_params", False))
         fe_dict = recipe.get("find_edge", DEFAULT_FIND_EDGE)
         for dir_name, (tag_name, attr_name) in DIR_XML_MAPPING.items():
             d_el = ET.SubElement(edge_el, tag_name, Name=attr_name)

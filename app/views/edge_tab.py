@@ -101,6 +101,12 @@ class EdgeTab:
                      width=13, state="readonly").grid(
                          row=0, column=1, padx=5, pady=2, sticky='w')
 
+        self.edge_universal_var = tk.BooleanVar(value=False)
+        cb_universal = ttk.Checkbutton(lf_settings, text="Universal Parameters",
+                                       variable=self.edge_universal_var,
+                                       command=self._on_universal_toggle)
+        cb_universal.grid(row=0, column=2, padx=5, pady=2, sticky='e')
+
         # Slider params: (label, StringVar attr, default, min, max, res, fmt)
         slider_params = [
             ("Kernel Size:",     self.edge_kernel_var,  "9",     3,    201,   2,     "{:.0f}"),
@@ -269,9 +275,23 @@ class EdgeTab:
         old_dir = self.state.last_edge_dir
         if not self.state._is_loading_recipe:
             self.vm.save_current_dir_to_cache(old_dir, self._get_tk_vars())
+            if self.edge_universal_var.get():
+                for d in ["LEFT", "RIGHT", "TOP", "BOTTOM"]:
+                    if d != old_dir:
+                        self.state.edge_configs[d] = self.state.edge_configs[old_dir].copy()
         new_dir = self.edge_dir_var.get()
         self.update_sliders_from_cache(new_dir)
         self.state.last_edge_dir = new_dir
+
+    def _on_universal_toggle(self):
+        """If checked, instantly sync the current configuration to all directions."""
+        if self.edge_universal_var.get():
+            active_dir = self.edge_dir_var.get()
+            self.vm.save_current_dir_to_cache(active_dir, self._get_tk_vars())
+            for d in ["LEFT", "RIGHT", "TOP", "BOTTOM"]:
+                if d != active_dir:
+                    self.state.edge_configs[d] = self.state.edge_configs[active_dir].copy()
+            self._log(f"[Edge] Universal parameters applied from {active_dir} to all directions.")
 
     # ------------------------------------------------------------------
     # Public helpers (called by main_window for recipe sync + server sync)
@@ -280,11 +300,22 @@ class EdgeTab:
     def update_sliders_from_cache(self, direction: str):
         """Populate sliders from AppState cache for *direction*."""
         cfg = self.state.edge_configs.get(direction, {})
-        if "KernelSize"      in cfg: self.edge_kernel_var.set(cfg["KernelSize"])
-        if "EdgeThreshold"   in cfg: self.edge_thresh_var.set(cfg["EdgeThreshold"])
-        if "NumRegions"      in cfg: self.edge_regions_var.set(cfg["NumRegions"])
-        if "BorderIgnorePct" in cfg: self.edge_border_var.set(cfg["BorderIgnorePct"])
-        if "RansacThreshold" in cfg: self.edge_ransac_var.set(cfg["RansacThreshold"])
+        
+        def _set_var(var, key):
+            if key in cfg:
+                val_str = cfg[key]
+                var.set(val_str)
+                if id(var) in self.edge_scales:
+                    try:
+                        self.edge_scales[id(var)].set(float(val_str))
+                    except ValueError:
+                        pass
+
+        _set_var(self.edge_kernel_var,  "KernelSize")
+        _set_var(self.edge_thresh_var,  "EdgeThreshold")
+        _set_var(self.edge_regions_var, "NumRegions")
+        _set_var(self.edge_border_var,  "BorderIgnorePct")
+        _set_var(self.edge_ransac_var,  "RansacThreshold")
 
     def enable_buttons(self):
         self.btn_find_edge.config(state='normal')

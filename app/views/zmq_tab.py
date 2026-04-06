@@ -69,7 +69,7 @@ class ZmqTab:
                                     width=25, command=self.on_start_server)
         self.btn_start.grid(row=0, column=4, padx=10)
 
-        self.btn_stop = ttk.Button(top, text="Stop Server",
+        self.btn_stop = ttk.Button(top, text="Stop Server", state='disabled',
                                    width=25, command=self.on_stop_server)
         self.btn_stop.grid(row=0, column=5, padx=10)
 
@@ -110,6 +110,8 @@ class ZmqTab:
         if self.server_thread and self.server_thread.is_alive():
             self.log(self.log_status, "Server is already running.")
             return
+
+        self.btn_start.config(state='disabled')
 
         try:
             ui_port = int(self.port_var.get())
@@ -167,6 +169,7 @@ class ZmqTab:
                     if not loop_ready.is_set():
                         root.after(0, lambda: self.log(
                             self.log_status, "Server loop did not start in time."))
+                        root.after(0, lambda: self.btn_start.config(state='normal'))
                         return
 
                     import json as _json
@@ -184,17 +187,22 @@ class ZmqTab:
                         if data.get("status") == "pong":
                             self.socket = sock
                             self.is_connected = True
-                            root.after(0, lambda: self.log(
-                                self.log_status,
-                                f"Connected to server at {addr} (PING ok)"))
+                            
+                            def on_ping_success():
+                                self.log(self.log_status, f"Connected to server at {addr} (PING ok)")
+                                self.btn_stop.config(state='normal')
+                                
+                            root.after(0, on_ping_success)
                             return
 
                     sock.close(linger=0)
                     root.after(0, lambda: self.log(
                         self.log_status, "Server started but PING timed out."))
+                    root.after(0, lambda: self.btn_start.config(state='normal'))
                 except Exception as ex:
                     root.after(0, lambda: self.log(
                         self.log_status, f"PING error: {ex}"))
+                    root.after(0, lambda: self.btn_start.config(state='normal'))
                 finally:
                     self._ping_active = False   # allow future attempts
 
@@ -203,11 +211,15 @@ class ZmqTab:
         except Exception as e:
             self._ping_active = False
             self.log(self.log_status, f"Error starting server: {e}")
+            self.btn_start.config(state='normal')
 
 
     def on_stop_server(self):
         """Stop the server immediately without blocking the main thread."""
         self.log(self.log_status, "Stopping server...")
+
+        self.btn_stop.config(state='disabled')
+        self.btn_start.config(state='normal')
 
         # Snapshot state so the background thread can clean up safely
         socket_to_close = self.socket

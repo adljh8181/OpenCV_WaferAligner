@@ -47,7 +47,9 @@ class PatternViewModel:
     def _get_current_config_str(self):
         """Returns a string representation of the current config settings"""
         cfg = self.linemod_matcher.config
-        return f"{cfg.NUM_FEATURES}_{cfg.WEAK_THRESHOLD}_{cfg.T_PYRAMID}_{cfg.HYSTERESIS_KERNEL}_{cfg.ANGLE_STEP}_{cfg.SCALE_MIN}_{cfg.SCALE_MAX}"
+        img_hash = hash(self.linemod_matcher.template_image.tobytes()) if self.linemod_matcher.template_image is not None else 0
+        mask_hash = hash(self.linemod_matcher.detection_mask.tobytes()) if self.linemod_matcher.detection_mask is not None else 0
+        return f"{cfg.NUM_FEATURES}_{cfg.WEAK_THRESHOLD}_{cfg.T_PYRAMID}_{cfg.HYSTERESIS_KERNEL}_{cfg.ANGLE_STEP}_{cfg.SCALE_MIN}_{cfg.SCALE_MAX}_{img_hash}_{mask_hash}"
 
     # ------------------------------------------------------------------
     # Config
@@ -170,8 +172,18 @@ class PatternViewModel:
         self.state.template_crop_cx = orig_x + orig_w / 2.0
         self.state.template_crop_cy = orig_y + orig_h / 2.0
 
+        # Remove previously generated temp files first
+        try:
+            for f in os.listdir(os.getcwd()):
+                if f.startswith("temp_cropped_template_"):
+                    os.remove(os.path.join(os.getcwd(), f))
+        except Exception:
+            pass
+
+        import time
+        timestamp = int(time.time() * 1000)
         cropped = src[orig_y:orig_y + orig_h, orig_x:orig_x + orig_w]
-        out_path = os.path.join(os.getcwd(), "temp_cropped_template.png")
+        out_path = os.path.join(os.getcwd(), f"temp_cropped_template_{timestamp}.png")
         cv2.imwrite(out_path, cropped)
 
         img = cv2.imread(out_path, cv2.IMREAD_GRAYSCALE)
@@ -275,17 +287,35 @@ class PatternViewModel:
     @staticmethod
     def _select_roi_safe(image, window_title):
         """
-        Custom rectangle ROI selector that handles the window X button.
+        Custom rectangle ROI selector with Save/Close buttons.
         Returns (x, y, w, h) or None if cancelled.
         """
+        from app.views.mask_editor import _draw_button, _point_in_rect
+
+        h_i, w_i = image.shape[:2]
         drawing = False
         x0 = y0 = x1 = y1 = 0
-        confirmed = False
-        cancelled = False
+        action = None  # 'save' or 'close'
+        cursor_pos = (0, 0)
+
+        # Button dimensions
+        btn_w, btn_h = 90, 30
+        btn_gap = 10
+        btn_save_rect = (w_i - 2 * btn_w - btn_gap - 10, h_i - btn_h - 10,
+                         btn_w, btn_h)
+        btn_close_rect = (w_i - btn_w - 10, h_i - btn_h - 10,
+                          btn_w, btn_h)
 
         def _mouse_cb(event, mx, my, flags, param):
-            nonlocal drawing, x0, y0, x1, y1
+            nonlocal drawing, x0, y0, x1, y1, action, cursor_pos
+            cursor_pos = (mx, my)
             if event == cv2.EVENT_LBUTTONDOWN:
+                if _point_in_rect(mx, my, btn_save_rect):
+                    action = 'save'
+                    return
+                if _point_in_rect(mx, my, btn_close_rect):
+                    action = 'close'
+                    return
                 drawing = True
                 x0, y0 = mx, my
                 x1, y1 = mx, my
@@ -298,6 +328,9 @@ class PatternViewModel:
         cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback(window_title, _mouse_cb)
 
+        confirmed = False
+        cancelled = False
+
         while True:
             vis = image.copy()
             if x0 != x1 and y0 != y1:
@@ -307,20 +340,27 @@ class PatternViewModel:
                 rh = abs(y1 - y0)
                 cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh),
                               (0, 255, 0), 2)
-                # Crosshair
                 cx, cy = rx + rw // 2, ry + rh // 2
                 cv2.line(vis, (rx, cy), (rx + rw, cy), (0, 255, 0), 1)
                 cv2.line(vis, (cx, ry), (cx, ry + rh), (0, 255, 0), 1)
 
             # Instructions
-            h_i, w_i = vis.shape[:2]
             font_s = max(0.4, 0.5 * (w_i / 1000))
-            cv2.putText(vis, "Drag rect | ENTER: confirm | ESC: cancel",
+            cv2.putText(vis, "Drag rectangle to select region",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, font_s,
                         (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(vis, "Drag rect | ENTER: confirm | ESC: cancel",
+            cv2.putText(vis, "Drag rectangle to select region",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, font_s,
                         (255, 255, 0), 1, cv2.LINE_AA)
+
+            # Buttons
+            mx, my = cursor_pos
+            _draw_button(vis, "Save", *btn_save_rect,
+                         color=(40, 120, 40),
+                         hover=_point_in_rect(mx, my, btn_save_rect))
+            _draw_button(vis, "Close", *btn_close_rect,
+                         color=(40, 40, 140),
+                         hover=_point_in_rect(mx, my, btn_close_rect))
 
             cv2.imshow(window_title, vis)
             key = cv2.waitKey(16) & 0xFF
@@ -335,10 +375,20 @@ class PatternViewModel:
                 cancelled = True
                 break
 
-            if key == 27:  # Esc
+            # Button clicks
+            if action == 'save':
+                confirmed = True
+                action = None
+                break
+            elif action == 'close':
+                cancelled = True
+                action = None
+                break
+
+            if key == 27:
                 cancelled = True
                 break
-            elif key in (13, 10):  # Enter
+            elif key in (13, 10):
                 confirmed = True
                 break
 

@@ -10,8 +10,8 @@ Controls:
   - Right-click + drag: erase (remove painted region)
   - Mouse wheel:        increase / decrease brush size
   - 'r':                reset (clear all paint)
-  - Enter:              confirm mask
-  - Escape:             cancel (returns None → use full template)
+  - [Save] button or Enter:  confirm mask
+  - [Close] button or Escape: cancel (returns None)
 
 Returns a binary mask (uint8, 255=painted region, 0=outside).
 ================================================================================
@@ -19,6 +19,30 @@ Returns a binary mask (uint8, 255=painted region, 0=outside).
 
 import cv2
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: draw a clickable button on an OpenCV image
+# ---------------------------------------------------------------------------
+def _draw_button(img, text, x, y, w, h, color=(60, 60, 60),
+                 text_color=(255, 255, 255), hover=False):
+    """Draw a rounded-rect button. Returns (x, y, w, h) hit-box."""
+    fill = tuple(min(255, c + 40) for c in color) if hover else color
+    cv2.rectangle(img, (x, y), (x + w, y + h), fill, -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (200, 200, 200), 1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = max(0.45, h / 40)
+    (tw, th_t), _ = cv2.getTextSize(text, font, fs, 1)
+    tx = x + (w - tw) // 2
+    ty = y + (h + th_t) // 2
+    cv2.putText(img, text, (tx, ty), font, fs, text_color, 1, cv2.LINE_AA)
+    return (x, y, w, h)
+
+
+def _point_in_rect(px, py, rect):
+    """Check if point is inside (x, y, w, h) rectangle."""
+    rx, ry, rw, rh = rect
+    return rx <= px <= rx + rw and ry <= py <= ry + rh
 
 
 def draw_detection_mask(template_img, window_title="Paint Detection Region"):
@@ -78,13 +102,22 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
     max_brush = max(30, min(disp_w, disp_h) // 5)
     brush_step = max(1, brush_radius // 5)
 
+    # Button dimensions
+    btn_w, btn_h = 90, 30
+    btn_gap = 10
+    btn_save_rect = (disp_w - 2 * btn_w - btn_gap - 10, disp_h - btn_h - 10,
+                     btn_w, btn_h)
+    btn_close_rect = (disp_w - btn_w - 10, disp_h - btn_h - 10,
+                      btn_w, btn_h)
+
     painting = False
     erasing = False
     cursor_pos = (disp_w // 2, disp_h // 2)
     needs_redraw = True
+    action = None  # 'save' or 'close'
 
     def _redraw():
-        """Composite background + mask overlay + cursor. Fast path."""
+        """Composite background + mask overlay + cursor + buttons."""
         vis = bg_display.copy()
 
         # Blend green where mask is painted
@@ -102,8 +135,7 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
         # Instructions (small, top-left)
         font_scale = max(0.35, 0.45 * (disp_w / 800))
         lines = [
-            "L-drag: paint | R-drag: erase | Scroll: brush size",
-            f"R: reset | ENTER: confirm | ESC: cancel | Brush: {brush_radius}px"
+            "L-drag: paint | R-drag: erase | Scroll: brush size | R: reset",
         ]
         for i, txt in enumerate(lines):
             y = 16 + i * 16
@@ -111,6 +143,14 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
                         font_scale, (0, 0, 0), 2, cv2.LINE_AA)
             cv2.putText(vis, txt, (6, y), cv2.FONT_HERSHEY_SIMPLEX,
                         font_scale, (255, 255, 0), 1, cv2.LINE_AA)
+
+        # Buttons (bottom-right)
+        hover_save = _point_in_rect(cx, cy, btn_save_rect)
+        hover_close = _point_in_rect(cx, cy, btn_close_rect)
+        _draw_button(vis, "Save", *btn_save_rect,
+                     color=(40, 120, 40), hover=hover_save)
+        _draw_button(vis, "Close", *btn_close_rect,
+                     color=(40, 40, 140), hover=hover_close)
 
         cv2.imshow(window_title, vis)
 
@@ -122,11 +162,18 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
 
     def _mouse_cb(event, mx, my, flags, param):
         nonlocal painting, erasing, cursor_pos, brush_radius, needs_redraw
-        nonlocal prev_pos
+        nonlocal prev_pos, action
 
         cursor_pos = (mx, my)
 
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Check button clicks first
+            if _point_in_rect(mx, my, btn_save_rect):
+                action = 'save'
+                return
+            if _point_in_rect(mx, my, btn_close_rect):
+                action = 'close'
+                return
             painting = True
             prev_pos = (mx, my)
             _paint_at(mx, my, 255)
@@ -148,20 +195,21 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if painting:
-                # Draw line between last and current position for smooth strokes
                 if prev_pos is not None:
-                    cv2.line(disp_mask, prev_pos, (mx, my), 255, brush_radius * 2)
+                    cv2.line(disp_mask, prev_pos, (mx, my), 255,
+                             brush_radius * 2)
                 _paint_at(mx, my, 255)
                 prev_pos = (mx, my)
                 needs_redraw = True
             elif erasing:
                 if prev_pos is not None:
-                    cv2.line(disp_mask, prev_pos, (mx, my), 0, brush_radius * 2)
+                    cv2.line(disp_mask, prev_pos, (mx, my), 0,
+                             brush_radius * 2)
                 _paint_at(mx, my, 0)
                 prev_pos = (mx, my)
                 needs_redraw = True
             else:
-                needs_redraw = True  # cursor only
+                needs_redraw = True  # cursor / hover only
 
         elif event == cv2.EVENT_MOUSEWHEEL:
             if flags > 0:
@@ -179,14 +227,20 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
     while True:
         key = cv2.waitKey(16) & 0xFF  # ~60 FPS cap
 
-        # Detect window closed via X button (getWindowProperty returns -1)
+        # Detect window closed via X button
         try:
             if cv2.getWindowProperty(window_title, cv2.WND_PROP_VISIBLE) < 1:
-                result_mask = None
                 break
         except cv2.error:
-            result_mask = None
             break
+
+        # Button clicks
+        if action == 'save':
+            key = 13  # treat as Enter
+            action = None
+        elif action == 'close':
+            key = 27  # treat as Escape
+            action = None
 
         if key == 27:  # Escape → cancel
             result_mask = None
@@ -198,13 +252,11 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
 
         elif key in (13, 10):  # Enter → confirm
             if np.any(disp_mask > 0):
-                # Upscale mask back to original resolution
                 if disp_scale < 1.0:
                     result_mask = cv2.resize(disp_mask, (w, h),
                                             interpolation=cv2.INTER_NEAREST)
                 else:
                     result_mask = disp_mask.copy()
-                # Binarize (ensure clean 0/255)
                 result_mask = (result_mask > 127).astype(np.uint8) * 255
             else:
                 result_mask = None

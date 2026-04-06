@@ -1,7 +1,7 @@
 <?xml version="1.0" ?>
-<Recipe name="ADLIM" version="1.0">
+<Recipe name="QES_1" version="1.0">
   <MetaData>
-    <CreatedAt>2026-03-17T17:19:35</CreatedAt>
+    <CreatedAt>2026-03-27T11:47:02</CreatedAt>
     <Description/>
   </MetaData>
   <FindWaferEdge>
@@ -37,14 +37,14 @@
   </FindWaferEdge>
   <FindPattern>
     <MatchThreshold>50.0</MatchThreshold>
-    <NumFeatures>128</NumFeatures>
+    <NumFeatures>379</NumFeatures>
     <GradThrPct>70.0</GradThrPct>
     <TSpread>4</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
-    <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\ADLIM_template.png</TemplatePath>
-    <TemplateCropCX>955.5</TemplateCropCX>
-    <TemplateCropCY>632.5</TemplateCropCY>
-    <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\ADLIM_template_mask.png</DetectionMaskPath>
+    <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\QES_1_template.png</TemplatePath>
+    <TemplateCropCX>2292.0</TemplateCropCX>
+    <TemplateCropCY>3485.0</TemplateCropCY>
+    <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\QES_1_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

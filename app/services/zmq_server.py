@@ -31,6 +31,23 @@ Protocol (all messages are UTF-8 JSON strings):
            or { "status": "no_match" }
            or { "status": "error", "message": "..." }
 
+  TEACH_REQ
+    Trigger an interactive teach session. Python opens the image in an
+    OpenCV window, lets the operator crop a template ROI and optionally
+    draw a detection mask, then saves the results and updates the recipe.
+
+    Request:  TEACH_REQ "<image_path>" "<recipe_path>"
+              Parameters (space-separated, paths may be quoted):
+                [0] image_path   – source image the operator crops from
+                [1] recipe_path  – recipe XML to update (name or full path)
+    Response: { "status": "ok",
+                "template_path": "C:\\...\\template.png",
+                "mask_path":     "C:\\...\\template_mask.png",  // or ""
+                "crop_cx":       512.0,
+                "crop_cy":       310.0 }
+           or { "status": "cancelled" }          // operator pressed ESC / Close
+           or { "status": "error", "message": "..." }
+
   SHUTDOWN
     Request:  { "cmd": "SHUTDOWN" }
     Response: { "status": "ok" }  (then server exits)
@@ -236,6 +253,14 @@ class WaferAlignmentServer:
                 
                 return {"status": "ok", "message": "train_reply OK"}
             return {"status": "error", "message": "TRAIN_REQ requires 2 parameters"}
+
+        elif cmd == "TEACH_REQ":
+            if len(parameters) >= 2:
+                return self._teach_template({
+                    "image_path":  parameters[0],
+                    "recipe_path": parameters[1]
+                })
+            return {"status": "error", "message": "TEACH_REQ requires 2 parameters: <image_path> <recipe_path>"}
 
         elif cmd == "WAFER_EDGE_REQ":
             if len(parameters) >= 3:
@@ -503,6 +528,202 @@ class WaferAlignmentServer:
         except Exception as exc:
             traceback.print_exc()
             return {"status": "error", "message": f"Failed to load recipe: {exc}"}
+
+    def _teach_template(self, msg: dict) -> dict:
+        """
+        Interactive template-teaching workflow triggered by TEACH_REQ.
+
+        Steps:
+          1. Open the source image in an OpenCV window so the operator can
+             drag-select the template crop region.
+          2. After confirming the crop, open the mask-drawing window so the
+             operator can paint the detection ROI (polygon) on the template.
+          3. Save the cropped template PNG (and mask PNG if drawn) into the
+             same folder as the recipe.
+          4. Update the recipe XML with the new TemplatePath, MaskPath and
+             crop-centre values.
+          5. Reload the matcher with the new template so MATCH commands work
+             immediately without a server restart.
+
+        Returns a JSON-serialisable dict:
+          { "status": "ok",
+            "template_path": "...",
+            "mask_path": "...",   # empty string if no mask drawn
+            "crop_cx": float,
+            "crop_cy": float }
+          or { "status": "cancelled" }
+          or { "status": "error", "message": "..." }
+        """
+        import time
+        img_path    = msg.get("image_path",  "")
+        recipe_path = msg.get("recipe_path", "")
+
+        # ── Validate inputs ──────────────────────────────────────────────
+        if not img_path:
+            return {"status": "error", "message": "image_path is required"}
+        if not os.path.isfile(img_path):
+            return {"status": "error", "message": f"Image not found: {img_path}"}
+
+        # Resolve recipe path (bare name → recipes directory)
+        if recipe_path and not os.path.isfile(recipe_path):
+            probe = os.path.join(self.recipe_mgr.recipes_root, recipe_path)
+            if not probe.lower().endswith(".xml"):
+                probe += ".xml"
+            if os.path.isfile(probe):
+                recipe_path = probe
+            else:
+                return {"status": "error", "message": f"Recipe not found: {recipe_path}"}
+
+        # ── Step 1: Load source image ────────────────────────────────────
+        try:
+            src_bgr = cv2.imread(img_path)
+            if src_bgr is None:
+                return {"status": "error", "message": f"cv2.imread failed for: {img_path}"}
+        except Exception as exc:
+            return {"status": "error", "message": f"Failed to read image: {exc}"}
+
+        sh, sw = src_bgr.shape[:2]
+
+        # Scale the display to fit 85 % of the screen
+        try:
+            import ctypes
+            user32   = ctypes.windll.user32
+            scr_w    = int(user32.GetSystemMetrics(0) * 0.85)
+            scr_h    = int(user32.GetSystemMetrics(1) * 0.85)
+        except Exception:
+            scr_w, scr_h = 1280, 900
+
+        roi_scale = min(scr_w / sw, scr_h / sh, 1.0)
+        display_img = (cv2.resize(src_bgr,
+                                  (int(sw * roi_scale), int(sh * roi_scale)),
+                                  interpolation=cv2.INTER_AREA)
+                       if roi_scale < 1.0 else src_bgr.copy())
+
+        # ── Step 2: Let operator drag-select template crop region ────────
+        self._log("[TEACH] Opening crop window — drag a rectangle and click Save.")
+        from app.viewmodels.pattern_viewmodel import PatternViewModel
+        roi = PatternViewModel._select_roi_safe(
+            display_img,
+            "TEACH: Select template region (drag rect, Save=confirm, Close=cancel)"
+        )
+
+        if roi is None:
+            self._log("[TEACH] Cancelled by operator (crop step).")
+            return {"status": "cancelled"}
+
+        rx, ry, rw, rh = roi
+        if rw <= 0 or rh <= 0:
+            return {"status": "error", "message": "Invalid crop region (zero size)."}
+
+        # Map display-space ROI back to original image pixels
+        orig_x = int(rx / roi_scale)
+        orig_y = int(ry / roi_scale)
+        orig_w = int(rw / roi_scale)
+        orig_h = int(rh / roi_scale)
+
+        crop_cx = orig_x + orig_w / 2.0
+        crop_cy = orig_y + orig_h / 2.0
+        cropped_bgr = src_bgr[orig_y:orig_y + orig_h, orig_x:orig_x + orig_w]
+
+        # ── Step 3: Save cropped template PNG ────────────────────────────
+        # Name the template after the recipe so each recipe has its own file
+        # and cleanup is scoped to that specific recipe only.
+        recipe_dir  = os.path.dirname(recipe_path) if recipe_path else os.getcwd()
+        recipe_name = os.path.splitext(os.path.basename(recipe_path))[0] if recipe_path else "teach"
+        tmpl_filename = f"{recipe_name}_template.png"
+        tmpl_path    = os.path.join(recipe_dir, tmpl_filename)
+        mask_filename = f"{recipe_name}_template_mask.png"
+
+        # Clean up only the previous template/mask for THIS recipe
+        try:
+            for f in [tmpl_filename, mask_filename]:
+                fp = os.path.join(recipe_dir, f)
+                if os.path.exists(fp):
+                    os.remove(fp)
+        except Exception:
+            pass
+
+        try:
+            cv2.imwrite(tmpl_path, cropped_bgr)
+            self._log(f"[TEACH] Template saved → {tmpl_path}")
+        except Exception as exc:
+            return {"status": "error", "message": f"Failed to save template: {exc}"}
+
+        # ── Step 4: Let operator draw detection mask (optional) ──────────
+        self._log("[TEACH] Opening mask window — draw polygon then Save, or Close to skip.")
+        mask_path = ""
+        mask_img  = None
+        try:
+            from app.views.mask_editor import draw_detection_mask
+            template_bgr = cv2.imread(tmpl_path)
+            if template_bgr is not None:
+                mask_img = draw_detection_mask(
+                    template_bgr,
+                    window_title="TEACH: Draw Detection Region (L-click=add, R-click=close poly, Save=confirm)"
+                )
+                if mask_img is not None:
+                    mask_path = os.path.join(recipe_dir, mask_filename)
+                    cv2.imwrite(mask_path, mask_img)
+                    self._log(f"[TEACH] Mask saved → {mask_path}")
+                else:
+                    self._log("[TEACH] No mask drawn — using full template for detection.")
+        except Exception as exc:
+            self._log(f"[TEACH] Mask step skipped due to error: {exc}")
+
+        # ── Step 5: Update recipe XML ────────────────────────────────────
+        if recipe_path and os.path.isfile(recipe_path):
+            try:
+                recipe = self.recipe_mgr.load(recipe_path)
+                fp = recipe.setdefault("find_pattern", {})
+                fp["TemplatePath"]      = tmpl_path
+                fp["TemplateCropCX"]    = str(crop_cx)
+                fp["TemplateCropCY"]    = str(crop_cy)
+                fp["DetectionMaskPath"] = mask_path
+                self.recipe_mgr.save(recipe)
+                self._log(f"[TEACH] Recipe updated: {recipe_path}")
+            except Exception as exc:
+                self._log(f"[TEACH] Warning: could not update recipe — {exc}")
+
+        # ── Step 6: Reload matcher in server so MATCH works immediately ──
+        try:
+            img_gray = cv2.imread(tmpl_path, cv2.IMREAD_GRAYSCALE)
+            if img_gray is not None:
+                if mask_img is not None:
+                    self.matcher.load_template(img_gray, detection_mask=mask_img
+                                               if len(mask_img.shape) == 2
+                                               else cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY))
+                else:
+                    self.matcher.load_template(img_gray)
+                self.matcher.generate_templates()
+                self._template_loaded = True
+                self.template_crop_cx  = crop_cx
+                self.template_crop_cy  = crop_cy
+                self._log("[TEACH] Matcher reloaded with new template.")
+        except Exception as exc:
+            self._log(f"[TEACH] Warning: matcher reload failed — {exc}")
+
+        # ── Notify UI (if embedded) ──────────────────────────────────────
+        if self.ui_sync_callback:
+            try:
+                self.ui_sync_callback({
+                    "event":         "TEACH_REQ",
+                    "image_path":    img_path,
+                    "recipe_path":   recipe_path,
+                    "template_path": tmpl_path,
+                    "mask_path":     mask_path,
+                    "crop_cx":       crop_cx,
+                    "crop_cy":       crop_cy,
+                })
+            except Exception:
+                pass
+
+        return {
+            "status":        "ok",
+            "template_path": tmpl_path,
+            "mask_path":     mask_path,
+            "crop_cx":       crop_cx,
+            "crop_cy":       crop_cy,
+        }
 
 # Entry point
 

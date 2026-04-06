@@ -58,6 +58,8 @@ class PatternTab:
         self.pattern_score_var  = tk.StringVar(value="0")
         self.pattern_x_var      = tk.StringVar(value="0")
         self.pattern_y_var      = tk.StringVar(value="0")
+        
+        self.pattern_scales     = {}
 
         self._build()
 
@@ -208,7 +210,16 @@ class PatternTab:
                           orient='horizontal', command=_on_slide)
         scale.set(default)
         scale.grid(row=row, column=1, padx=5, pady=4, sticky='ew')
+        self.pattern_scales[id(str_var)] = scale
         return scale
+
+    def set_slider_value(self, str_var, value):
+        str_var.set(str(value))
+        if id(str_var) in self.pattern_scales:
+            try:
+                self.pattern_scales[id(str_var)].set(float(value))
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -246,6 +257,8 @@ class PatternTab:
             self._display_image(out_path, self.lbl_template_img)
             self.btn_draw_roi.config(state='normal')
             self.btn_clear_mask.config(state='normal')
+            # Automatically invoke the ROI drawing as a convenience
+            self._on_draw_roi()
 
     def _on_draw_roi(self):
         template_path = self.template_img_var.get()
