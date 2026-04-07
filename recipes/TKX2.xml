@@ -12,6 +12,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
     </WaferAlignLeftParam>
     <WaferAlignRightParam Name="WaferAlign Right Parm">
       <KernelSize>120</KernelSize>
@@ -19,6 +20,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
     </WaferAlignRightParam>
     <WaferAlignTopParam Name="WaferAlign Top Parm">
       <KernelSize>120</KernelSize>
@@ -26,6 +28,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
     </WaferAlignTopParam>
     <WaferAlignBotParam Name="WaferAlign Bot Parm">
       <KernelSize>120</KernelSize>
@@ -33,6 +36,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
     </WaferAlignBotParam>
   </FindWaferEdge>
   <FindPattern>
@@ -43,8 +47,8 @@
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
-    <TemplateCropCX>2294.5</TemplateCropCX>
-    <TemplateCropCY>3477.0</TemplateCropCY>
+    <TemplateCropCX>2297.0</TemplateCropCX>
+    <TemplateCropCY>3485.0</TemplateCropCY>
     <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

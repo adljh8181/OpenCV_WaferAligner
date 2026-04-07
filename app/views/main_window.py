@@ -279,6 +279,7 @@ class WaferAlignerUI:
             self.state.edge_configs[active_dir]["NumRegions"]       = et.edge_regions_var.get()
             self.state.edge_configs[active_dir]["BorderIgnorePct"]  = et.edge_border_var.get()
             self.state.edge_configs[active_dir]["RansacThreshold"]  = et.edge_ransac_var.get()
+            self.state.edge_configs[active_dir]["EdgePolarity"]     = et.edge_polarity_var.get()
 
             if et.edge_universal_var.get():
                 for d in ["LEFT", "RIGHT", "TOP", "BOTTOM"]:
@@ -361,6 +362,11 @@ class WaferAlignerUI:
 
                 direction = payload.get("direction", "LEFT")
                 self.edge_tab.edge_dir_var.set(direction)
+
+                # Apply the actual config used by the server (post-polarity-override)
+                edge_config = payload.get("edge_config")
+                if edge_config:
+                    self.edge_tab.update_sliders_from_config(edge_config)
 
                 img_path = payload.get("image_path", "")
                 if img_path:

@@ -78,6 +78,7 @@ class EdgeViewModel:
             self.edge_finder.config.BORDER_IGNORE_PCT = float(tk_vars['edge_border_var'].get())
             self.edge_finder.config.RANSAC_THRESHOLD  = float(tk_vars['edge_ransac_var'].get())
             self.edge_finder.config.SCAN_DIRECTION    = tk_vars['edge_dir_var'].get()
+            self.edge_finder.config.EDGE_POLARITY     = tk_vars['edge_polarity_var'].get()
             self.edge_finder.kernel = create_gradient_kernel(kernel_size)
         except Exception as e:
             self._log(f"Edge config parse error: {e}")
@@ -85,13 +86,13 @@ class EdgeViewModel:
 
         return self.edge_finder.find_edge(path, skip_classification=True)
 
-    def build_overlay_func(self, resp: dict) -> callable:
+    def build_overlay_func(self, resp: dict, edge_finder=None) -> callable:
         """
         Returns a cv2 overlay draw-function for the result image label.
         The function takes a BGR image and draws the detected edge line + points.
         """
         e = resp['line_endpoints']
-        ef = self.edge_finder   # capture for closure
+        ef = edge_finder or self.edge_finder   # capture for closure
 
         def draw_edge_overlay(img):
             h, w = img.shape[:2]
@@ -121,10 +122,15 @@ class EdgeViewModel:
 
         return draw_edge_overlay
 
-    def compute_gradient_display(self, resp: dict):
+    def compute_gradient_display(self, resp: dict, edge_finder=None):
         """
         Compute the gradient magnitude image (for the bottom-left panel)
         and the 1-D gradient profile (for the matplotlib graph).
+
+        Args:
+            resp:        Result dict from EdgeLineFinder.find_edge()
+            edge_finder: Optional EdgeLineFinder to use for kernel/config.
+                         If None, uses the VM's own edge_finder.
 
         Returns:
             (grad_bgr, abs_gradient_1d, cfg)
@@ -132,11 +138,12 @@ class EdgeViewModel:
             abs_gradient_1d   – 1-D numpy array of gradient magnitudes
             cfg               – EdgeFinderConfig (for threshold + kernel size)
         """
+        ef = edge_finder or self.edge_finder
         img_proc = resp['image']
         h_img, w_img = img_proc.shape
-        kernel = self.edge_finder.kernel
+        kernel = ef.kernel
         is_vertical = resp.get('is_vertical_edge', True)
-        cfg = self.edge_finder.config
+        cfg = ef.config
         e = resp['line_endpoints']
 
         # ── 2-D gradient magnitude ────────────────────────────────────────
@@ -193,6 +200,7 @@ class EdgeViewModel:
         cfg["NumRegions"]      = tk_vars['edge_regions_var'].get()
         cfg["BorderIgnorePct"] = tk_vars['edge_border_var'].get()
         cfg["RansacThreshold"] = tk_vars['edge_ransac_var'].get()
+        cfg["EdgePolarity"]    = tk_vars['edge_polarity_var'].get()
 
     def get_cache_for_dir(self, direction: str) -> dict:
         """Return the cached config dict for *direction*."""

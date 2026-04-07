@@ -39,6 +39,13 @@ class EdgeFinderConfig(ClassificationConfig):
     # TOP/BOTTOM: Wafer edge is on top/bottom side (horizontal edge line)
     SCAN_DIRECTION = "LEFT"
 
+    # --- EDGE POLARITY ---
+    # Options: "ANY", "LIGHT_TO_DARK", "DARK_TO_LIGHT"
+    # ANY:            Detect edges on any contrast change (default, same as before)
+    # LIGHT_TO_DARK:  Only detect bright-to-dark transitions (negative gradient)
+    # DARK_TO_LIGHT:  Only detect dark-to-bright transitions (positive gradient)
+    EDGE_POLARITY = "ANY"
+
     # --- FIND EDGE SETTINGS ---
     NUM_REGIONS = 40            # Number of scan regions
     EDGE_THRESHOLD = 25         # Minimum gradient to count as edge point
@@ -280,6 +287,9 @@ class EdgeLineFinder:
 
                 # Calculate gradient
                 gradient = np.convolve(profile, self.kernel, mode='same')
+
+                # Apply polarity filter before taking absolute value
+                gradient = self._apply_polarity(gradient)
                 abs_gradient = np.abs(gradient)
 
                 # Clean borders
@@ -320,6 +330,9 @@ class EdgeLineFinder:
 
                 # Calculate gradient
                 gradient = np.convolve(profile, self.kernel, mode='same')
+
+                # Apply polarity filter before taking absolute value
+                gradient = self._apply_polarity(gradient)
                 abs_gradient = np.abs(gradient)
 
                 # Clean borders
@@ -376,6 +389,51 @@ class EdgeLineFinder:
             'is_vertical_edge': is_vertical_edge,
             'reason': line_result.get('reason')
         }
+
+    def _apply_polarity(self, gradient):
+        """
+        Filter the signed gradient based on the configured edge polarity,
+        relative to the user's chosen scan direction.
+
+        The gradient kernel [-1,...,0,...,1] always computes left-to-right
+        (or top-to-bottom), producing:
+          - Positive values for dark-to-light transitions
+          - Negative values for light-to-dark transitions
+
+        However, for LEFT and TOP scan directions the conceptual search
+        vector points in the OPPOSITE direction (right→left, bottom→top).
+        In those cases we flip the polarity interpretation so that
+        "Light-to-Dark" always means "bright on the approach side, dark
+        after crossing the edge" — regardless of scan direction.
+
+        Args:
+            gradient: 1-D signed gradient array from np.convolve()
+
+        Returns:
+            Filtered gradient (same shape). Unwanted polarity values are
+            zeroed so that the subsequent np.abs() + peak-finding only
+            sees the desired transitions.
+        """
+        polarity = self.config.EDGE_POLARITY.upper()
+        if polarity == "ANY":
+            return gradient
+
+        direction = self.config.SCAN_DIRECTION.upper()
+
+        # For LEFT/TOP the search vector is opposite to the gradient
+        # computation direction, so we flip the polarity meaning.
+        flip = direction in ("LEFT", "TOP")
+
+        want_negative = (polarity == "LIGHT_TO_DARK")
+        if flip:
+            want_negative = not want_negative
+
+        if want_negative:
+            # Keep only negative gradient spikes, zero out positive
+            return np.minimum(gradient, 0)
+        else:
+            # Keep only positive gradient spikes, zero out negative
+            return np.maximum(gradient, 0)
 
     def _detect_edge_point_horizontal(self, abs_gradient, profile, y_start, region_h, edge_info=None):
         """Detect edge point in a horizontal region (for LEFT/RIGHT edge detection)"""

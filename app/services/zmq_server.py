@@ -48,6 +48,32 @@ Protocol (all messages are UTF-8 JSON strings):
            or { "status": "cancelled" }          // operator pressed ESC / Close
            or { "status": "error", "message": "..." }
 
+  WAFER_EDGE_REQ
+    Find the wafer edge and return its offset from the image centre.
+
+    Request:  WAFER_EDGE_REQ "<image_path>" "<recipe_path>" <direction> [<polarity>] [FORCE_RUN]
+              Parameters (space-separated, paths must be quoted):
+                [0] image_path   – full path to the image to analyse
+                [1] recipe_path  – recipe XML to use (name or full path)
+                [2] direction    – LEFT | RIGHT | TOP | BOTTOM
+                [3] polarity     – ANY | LIGHT_TO_DARK | DARK_TO_LIGHT  (optional)
+                                   If omitted, the polarity saved in the recipe is used.
+                [4] FORCE_RUN    – literal string "FORCE_RUN"  (optional)
+                                   Skips FOV classification and runs edge detection
+                                   regardless of image type. Use after the operator
+                                   acknowledges a die_fov_warning and chooses to proceed.
+    Response: { "status": "ok",
+                "delta_x": -123.4, "delta_y": 5.6,
+                "fov_type": "EDGE_FOV", "fov_confidence": 0.95,
+                "a": .., "b": .., "c": ..,
+                "x_top": .., "x_bot": ..   }   // vertical edge (LEFT/RIGHT)
+         or   { ..., "y_left": .., "y_right": .. }  // horizontal edge (TOP/BOTTOM)
+           or { "status": "die_fov_warning",
+                "fov_type": "DIE_FOV", "fov_confidence": 0.91,
+                "message": "Image classified as DIE_FOV. Resend with FORCE_RUN to override." }
+           or { "status": "no_edge",  "reason": "...", "fov_type": "EDGE_FOV" }
+           or { "status": "error",    "message": "..." }
+
   SHUTDOWN
     Request:  { "cmd": "SHUTDOWN" }
     Response: { "status": "ok" }  (then server exits)
@@ -267,26 +293,49 @@ class WaferAlignmentServer:
                 # parameters[0] = Image Path
                 # parameters[1] = Recipe Name
                 # parameters[2] = Scan Direction ("LEFT", "RIGHT", "TOP", "BOTTOM")
-                
-                self._load_recipe({"recipe_path": parameters[1]})
-                result = self._find_edge({
-                    "search_path": parameters[0],
-                    "scan_direction": parameters[2]
-                })
+                # parameters[3] = Edge Polarity  ("ANY", "LIGHT_TO_DARK", "DARK_TO_LIGHT") — optional
+                # parameters[4] = "FORCE_RUN" — skip FOV check (optional)
+                # Note: FORCE_RUN is detected anywhere in parameters[3:] so polarity can be omitted.
 
-                if self.ui_sync_callback:
+                self._load_recipe({"recipe_path": parameters[1]})
+
+                # Detect FORCE_RUN anywhere in the optional parameters
+                force_run = any(p.upper() == "FORCE_RUN" for p in parameters[3:])
+
+                find_edge_args = {
+                    "search_path":    parameters[0],
+                    "scan_direction": parameters[2],
+                    "force_run":      force_run,
+                }
+                # Optional polarity override — only if parameters[3] is a polarity value
+                if len(parameters) >= 4 and parameters[3].upper() != "FORCE_RUN":
+                    find_edge_args["polarity_override"] = parameters[3].upper()
+
+                result = self._find_edge(find_edge_args)
+
+                # Only push UI sync for a real edge result (not a die_fov_warning)
+                if result.get("status") == "ok" and self.ui_sync_callback:
                     try:
                         self.ui_sync_callback({
-                            "event": "WAFER_EDGE_REQ",
-                            "image_path": parameters[0],
+                            "event":       "WAFER_EDGE_REQ",
+                            "image_path":  parameters[0],
                             "recipe_path": parameters[1],
-                            "direction": parameters[2].upper(),
-                            "result": result
+                            "direction":   parameters[2].upper(),
+                            "polarity":    parameters[3].upper() if (len(parameters) >= 4 and parameters[3].upper() != "FORCE_RUN") else None,
+                            "edge_config": {
+                                "KernelSize":      str(self.edge_finder.config.KERNEL_SIZE),
+                                "EdgeThreshold":   str(self.edge_finder.config.EDGE_THRESHOLD),
+                                "NumRegions":      str(self.edge_finder.config.NUM_REGIONS),
+                                "BorderIgnorePct": str(self.edge_finder.config.BORDER_IGNORE_PCT),
+                                "RansacThreshold": str(self.edge_finder.config.RANSAC_THRESHOLD),
+                                "EdgePolarity":    self.edge_finder.config.EDGE_POLARITY,
+                            },
+                            "result":      result
                         })
                     except: pass
-                
+
                 return result
-            return {"status": "error", "message": "WAFER_EDGE_REQ requires 3 parameters (Image Path, Recipe Path, Scan Direction)"}
+            return {"status": "error", "message": "WAFER_EDGE_REQ requires 3 parameters: <image_path> <recipe_path> <direction> [polarity] [FORCE_RUN]"}
 
         elif cmd == "LOADR_REQ":
             if len(parameters) >= 1:
@@ -407,8 +456,9 @@ class WaferAlignmentServer:
 
         try:
             direction = msg.get("scan_direction", "LEFT").upper()
+            force_run = msg.get("force_run", False)
             self.edge_finder.config.SCAN_DIRECTION = direction
-            
+
             # Apply specific direction parameters if loaded from recipe
             if hasattr(self, 'edge_configs') and direction in self.edge_configs:
                 d_cfg = self.edge_configs[direction]
@@ -417,7 +467,15 @@ class WaferAlignmentServer:
                 if "NumRegions" in d_cfg:      self.edge_finder.config.NUM_REGIONS = int(d_cfg["NumRegions"])
                 if "BorderIgnorePct" in d_cfg: self.edge_finder.config.BORDER_IGNORE_PCT = float(d_cfg["BorderIgnorePct"])
                 if "RansacThreshold" in d_cfg: self.edge_finder.config.RANSAC_THRESHOLD = float(d_cfg["RansacThreshold"])
-            
+                if "EdgePolarity" in d_cfg:    self.edge_finder.config.EDGE_POLARITY = d_cfg["EdgePolarity"]
+
+            # Optional per-call polarity override (from C# WAFER_EDGE_REQ parameter[3])
+            # This takes priority over the recipe value set above.
+            polarity_override = msg.get("polarity_override", "").upper()
+            if polarity_override in ("ANY", "LIGHT_TO_DARK", "DARK_TO_LIGHT"):
+                self.edge_finder.config.EDGE_POLARITY = polarity_override
+                self._log(f"[SERVER] Polarity overridden by command: {polarity_override}")
+
             # Update kernel in case KernelSize was changed
             if hasattr(self.edge_finder.config, 'KERNEL_SIZE'):
                 k_size = self.edge_finder.config.KERNEL_SIZE
@@ -425,27 +483,65 @@ class WaferAlignmentServer:
                 from app.services.fov_classifier import create_gradient_kernel
                 self.edge_finder.kernel = create_gradient_kernel(k_size)
 
+            # ── FOV Classification (skipped when FORCE_RUN is set) ────────
+            fov_type       = "EDGE_FOV"
+            fov_confidence = 1.0
+            if not force_run:
+                from app.services.fov_classifier import FOVClassifier, preprocess_image
+                fov_img, _, _ = preprocess_image(
+                    path, self.edge_finder.config.TARGET_PROCESS_DIM)
+                fov_result    = FOVClassifier(self.edge_finder.config).classify(fov_img)
+                fov_type      = fov_result.get('fov_type', 'UNCERTAIN')
+                fov_confidence = fov_result.get('confidence', 0.0)
+
+                if fov_type == "DIE_FOV":
+                    self._log(
+                        f"[SERVER] DIE_FOV detected (confidence={fov_confidence:.2f}) "
+                        f"— returning warning. C# should resend with FORCE_RUN to override."
+                    )
+                    return {
+                        "status":         "die_fov_warning",
+                        "fov_type":       fov_type,
+                        "fov_confidence": round(fov_confidence, 3),
+                        "message":        "Image classified as DIE_FOV. "
+                                          "Resend with FORCE_RUN to override."
+                    }
+                self._log(f"[SERVER] FOV check passed: {fov_type} (conf={fov_confidence:.2f})")
+            else:
+                self._log("[SERVER] FORCE_RUN set — skipping FOV classification.")
+
+            # ── Run edge detection ────────────────────────────────────────
             result = self.edge_finder.find_edge(path, skip_classification=True)
             self.edge_finder.last_result = result
 
             if not result['success']:
-                self._log(f"[SERVER] Edge not found: {result.get('reason')}, delta_x={result.get('delta_x', 0)}, delta_y={result.get('delta_y', 0)}")
-                return {"status": "no_edge", "reason": result.get('reason'), "delta_x": 0, "delta_y": 0}
+                self._log(f"[SERVER] Edge not found: {result.get('reason')}, "
+                          f"delta_x={result.get('delta_x', 0)}, delta_y={result.get('delta_y', 0)}")
+                return {
+                    "status":         "no_edge",
+                    "reason":         result.get('reason'),
+                    "delta_x":        0,
+                    "delta_y":        0,
+                    "fov_type":       fov_type,
+                    "fov_confidence": round(fov_confidence, 3),
+                }
 
             p = result['line_params']
             e = result['line_endpoints']
-            
+
             resp = {
-                "status": "ok",
+                "status":         "ok",
                 "a": float(p['a']), "b": float(p['b']), "c": float(p['c']),
                 "vx": float(p['vx']), "vy": float(p['vy']),
                 "x0": float(p['x0']), "y0": float(p['y0']),
-                "delta_x": float(result.get('delta_x', 0)),
-                "delta_y": float(result.get('delta_y', 0)),
+                "delta_x":        float(result.get('delta_x', 0)),
+                "delta_y":        float(result.get('delta_y', 0)),
+                "fov_type":       fov_type,
+                "fov_confidence": round(fov_confidence, 3),
             }
             if self.current_recipe_name:
                 resp["recipe_name"] = self.current_recipe_name
-            
+
             if result['is_vertical_edge']:
                 resp["x_top"] = float(e['x_top'])
                 resp["x_bot"] = float(e['x_bot'])

@@ -33,6 +33,7 @@ DEFAULT_DIRECTION_PARAMS = {
     "NumRegions":      "30",
     "BorderIgnorePct": "0.05",
     "RansacThreshold": "3.0",
+    "EdgePolarity":    "ANY",
 }
 
 DEFAULT_FIND_EDGE = {

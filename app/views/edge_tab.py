@@ -57,6 +57,7 @@ class EdgeTab:
         self.edge_border_var   = tk.StringVar(value="0.050")
         self.edge_ransac_var   = tk.StringVar(value="3.0")
         self.edge_dir_var      = tk.StringVar(value="LEFT")
+        self.edge_polarity_var = tk.StringVar(value="ANY")
 
         # Result display vars
         self.edge_delta_x_var = tk.StringVar(value="")
@@ -101,11 +102,18 @@ class EdgeTab:
                      width=13, state="readonly").grid(
                          row=0, column=1, padx=5, pady=2, sticky='w')
 
+        ttk.Label(lf_settings, text="Edge Polarity:").grid(
+            row=1, column=0, padx=5, pady=2, sticky='w')
+        ttk.Combobox(lf_settings, textvariable=self.edge_polarity_var,
+                     values=["ANY", "LIGHT_TO_DARK", "DARK_TO_LIGHT"],
+                     width=13, state="readonly").grid(
+                         row=1, column=1, padx=5, pady=2, sticky='w')
+
         self.edge_universal_var = tk.BooleanVar(value=False)
         cb_universal = ttk.Checkbutton(lf_settings, text="Universal Parameters",
                                        variable=self.edge_universal_var,
                                        command=self._on_universal_toggle)
-        cb_universal.grid(row=0, column=2, padx=5, pady=2, sticky='e')
+        cb_universal.grid(row=1, column=2, padx=5, pady=2, sticky='e')
 
         # Slider params: (label, StringVar attr, default, min, max, res, fmt)
         slider_params = [
@@ -119,7 +127,7 @@ class EdgeTab:
         lf_settings.columnconfigure(1, weight=1)
 
         for i, (label, str_var, default, vmin, vmax, res, fmt) in \
-                enumerate(slider_params, start=1):
+                enumerate(slider_params, start=2):
             self._make_slider(lf_settings, i, label, str_var,
                               float(default), vmin, vmax, fmt)
 
@@ -300,7 +308,10 @@ class EdgeTab:
     def update_sliders_from_cache(self, direction: str):
         """Populate sliders from AppState cache for *direction*."""
         cfg = self.state.edge_configs.get(direction, {})
-        
+        self.update_sliders_from_config(cfg)
+
+    def update_sliders_from_config(self, cfg: dict):
+        """Set sliders directly from a config dict (e.g. from server sync)."""
         def _set_var(var, key):
             if key in cfg:
                 val_str = cfg[key]
@@ -317,19 +328,24 @@ class EdgeTab:
         _set_var(self.edge_border_var,  "BorderIgnorePct")
         _set_var(self.edge_ransac_var,  "RansacThreshold")
 
+        # Polarity is a combobox, not a slider — set directly
+        polarity = cfg.get("EdgePolarity", "ANY")
+        self.edge_polarity_var.set(polarity)
+
     def enable_buttons(self):
         self.btn_find_edge.config(state='normal')
         self.btn_load_edge_search.config(state='normal')
 
     def _get_tk_vars(self) -> dict:
         return {
-            'edge_img_var':     self.edge_img_var,
-            'edge_kernel_var':  self.edge_kernel_var,
-            'edge_thresh_var':  self.edge_thresh_var,
-            'edge_regions_var': self.edge_regions_var,
-            'edge_border_var':  self.edge_border_var,
-            'edge_ransac_var':  self.edge_ransac_var,
-            'edge_dir_var':     self.edge_dir_var,
+            'edge_img_var':      self.edge_img_var,
+            'edge_kernel_var':   self.edge_kernel_var,
+            'edge_thresh_var':   self.edge_thresh_var,
+            'edge_regions_var':  self.edge_regions_var,
+            'edge_border_var':   self.edge_border_var,
+            'edge_ransac_var':   self.edge_ransac_var,
+            'edge_dir_var':      self.edge_dir_var,
+            'edge_polarity_var': self.edge_polarity_var,
         }
 
     def visualize_edge_result(self, resp, path: str, edge_finder_inst):
@@ -350,12 +366,13 @@ class EdgeTab:
             self.edge_slope_var.set(f"{resp.get('slope', 0):.6f}")
             self.edge_c_var.set(f"{resp.get('intercept_c', 0):.3f}")
 
-            overlay_func = self.vm.build_overlay_func(resp)
+            overlay_func = self.vm.build_overlay_func(resp, edge_finder=edge_finder_inst)
             self._display_cv2_image(img_color, self.lbl_edge_output,
                                     overlay_func=overlay_func)
 
             # Gradient panels
-            grad_bgr, abs_gradient_1d, cfg = self.vm.compute_gradient_display(resp)
+            grad_bgr, abs_gradient_1d, cfg = self.vm.compute_gradient_display(
+                resp, edge_finder=edge_finder_inst)
             self._display_cv2_image(grad_bgr, self.lbl_grad_magnitude)
 
             self.edge_ax2.clear()
