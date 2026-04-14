@@ -82,7 +82,7 @@ class PatternViewModel:
             cfg.WEAK_THRESHOLD   = -float(tk_vars['pattern_weak_var'].get())
             t_spread = int(tk_vars['pattern_tspread_var'].get())
             cfg.T_PYRAMID        = [t_spread, t_spread * 2, t_spread * 4]
-            cfg.HYSTERESIS_KERNEL = int(tk_vars['pattern_hyst_var'].get())
+            cfg.HYSTERESIS_KERNEL = 0  # Always auto (odd size computed from image resolution)
 
             if mode == 'Simple (Fast)':
                 cfg.ANGLE_STEP  = 360 # Will map to just [0] degrees

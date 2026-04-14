@@ -129,7 +129,6 @@ class PatternTab:
             ("Num Features:", self.pattern_num_var,    "128",   16,   512,   "{:.0f}"),
             ("Grad Thr %:",   self.pattern_weak_var,   "70.0",  1.0,  99.0,  "{:.1f}"),
             ("T Spread:",     self.pattern_tspread_var, "4",     1,    20,    "{:.0f}"),
-            ("Hyst Kernel:",  self.pattern_hyst_var,   "0",     0,    15,    "{:.0f}"),
             ("Search Rot °:", self.pattern_rot_var,    "0",     0,   360,    "{:.0f}"),
         ]
         lf_settings.columnconfigure(1, weight=1)

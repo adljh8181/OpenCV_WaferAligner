@@ -152,9 +152,10 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
             # Gaussian blur
             if not fast_mode:
                 if kernel_size > 0 and kernel_size >= 3:
+                    ks_blur = max(3, kernel_size | 1)  # enforce odd
                     blur_filter = cv2.cuda.createGaussianFilter(
                         cv2.CV_32F, cv2.CV_32F,
-                        (kernel_size, kernel_size), 0)
+                        (ks_blur, ks_blur), 0)
                     gpu_gray = blur_filter.apply(gpu_gray)
                 elif max_dim > 1500:
                     sigma = max(1.0, (max_dim - 1000) / 1500.0)
@@ -189,8 +190,8 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     if not _did_gpu:
         if not fast_mode:
             if kernel_size > 0:
-                if kernel_size >= 3:
-                    gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+                ks_blur = max(3, kernel_size | 1)  # enforce odd, min 3
+                gray = cv2.GaussianBlur(gray, (ks_blur, ks_blur), 0)
             elif max_dim > 1500:
                 sigma = max(1.0, (max_dim - 1000) / 1500.0)
                 ksize = int(sigma * 2) * 2 + 1
