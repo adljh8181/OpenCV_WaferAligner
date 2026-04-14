@@ -5,12 +5,14 @@
     <Description/>
   </MetaData>
   <FindWaferEdge>
+    <UseUniversalParams>False</UseUniversalParams>
     <WaferAlignLeftParam Name="WaferAlign Left Parm">
       <KernelSize>9</KernelSize>
       <EdgeThreshold>500</EdgeThreshold>
       <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.05</BorderIgnorePct>
+      <BorderIgnorePct>0.050</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignLeftParam>
     <WaferAlignRightParam Name="WaferAlign Right Parm">
       <KernelSize>9</KernelSize>
@@ -18,6 +20,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.05</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignRightParam>
     <WaferAlignTopParam Name="WaferAlign Top Parm">
       <KernelSize>9</KernelSize>
@@ -25,6 +28,7 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.05</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignTopParam>
     <WaferAlignBotParam Name="WaferAlign Bot Parm">
       <KernelSize>9</KernelSize>
@@ -32,17 +36,19 @@
       <NumRegions>30</NumRegions>
       <BorderIgnorePct>0.05</BorderIgnorePct>
       <RansacThreshold>3.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignBotParam>
   </FindWaferEdge>
   <FindPattern>
     <MatchThreshold>50.0</MatchThreshold>
     <NumFeatures>216</NumFeatures>
     <GradThrPct>86.5</GradThrPct>
-    <TSpread>4</TSpread>
+    <TSpread>1</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>With Rotation</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\small_images_template.png</TemplatePath>
-    <TemplateCropCX>412.0</TemplateCropCX>
-    <TemplateCropCY>624.5</TemplateCropCY>
+    <TemplateCropCX>89.5</TemplateCropCX>
+    <TemplateCropCY>111.0</TemplateCropCY>
+    <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\small_images_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

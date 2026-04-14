@@ -119,20 +119,29 @@ class ZmqTab:
             root    = self.tab.winfo_toplevel()
 
             def safe_log(msg):
-                if root.winfo_exists():
-                    root.after(0, lambda: self.log(self.log_status, msg))
+                try:
+                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_status, msg))
+                except RuntimeError:
+                    pass
 
             def safe_rx_log(msg):
-                if root.winfo_exists():
-                    root.after(0, lambda: self.log(self.log_rx, msg))
+                try:
+                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_rx, msg))
+                except RuntimeError:
+                    pass
 
             def safe_tx_log(msg):
-                if root.winfo_exists():
-                    root.after(0, lambda: self.log(self.log_tx, msg))
+                try:
+                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_tx, msg))
+                except RuntimeError:
+                    pass
 
             def safe_ui_sync(payload: dict):
-                if root.winfo_exists() and self._ui_sync_callback:
-                    root.after(0, lambda: self._ui_sync_callback(payload))
+                if self._ui_sync_callback:
+                    try:
+                        root.after(0, lambda: root.winfo_exists() and self._ui_sync_callback(payload))
+                    except RuntimeError:
+                        pass
 
             # Fired from inside server.run() once the poll loop is live
             loop_ready = threading.Event()
@@ -225,6 +234,7 @@ class ZmqTab:
         socket_to_close = self.socket
         thread_to_join  = self.server_thread
         was_connected   = self.is_connected
+        root            = self.tab.winfo_toplevel()   # capture on main thread
 
         # Clear state immediately so the UI reflects 'stopped' right away
         self.is_connected  = False
@@ -232,7 +242,6 @@ class ZmqTab:
         self.server_thread = None
 
         def _stop_bg():
-            root = self.tab.winfo_toplevel()
             # Send SHUTDOWN via a temporary socket (short timeout)
             if was_connected and socket_to_close is not None:
                 try:
@@ -251,9 +260,11 @@ class ZmqTab:
             if thread_to_join and thread_to_join.is_alive():
                 thread_to_join.join(timeout=3.0)
 
-            if root.winfo_exists():
-                root.after(0, lambda: self.log(
+            try:
+                root.after(0, lambda: root.winfo_exists() and self.log(
                     self.log_status, "Server stopped and disconnected."))
+            except RuntimeError:
+                pass
 
         threading.Thread(target=_stop_bg, daemon=True).start()
 

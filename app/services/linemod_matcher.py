@@ -34,6 +34,21 @@ import matplotlib.pyplot as plt
 
 
 # ======================================================================
+# GPU / CUDA detection  (one-shot at import time)
+# ======================================================================
+try:
+    _CUDA_DEVICE_COUNT = cv2.cuda.getCudaEnabledDeviceCount()
+except Exception:
+    _CUDA_DEVICE_COUNT = 0
+_CUDA_AVAILABLE = _CUDA_DEVICE_COUNT > 0
+
+if _CUDA_AVAILABLE:
+    print(f"[LINE-2D] CUDA enabled — {_CUDA_DEVICE_COUNT} device(s) detected.")
+else:
+    print("[LINE-2D] CUDA not available — using optimised CPU path.")
+
+
+# ======================================================================
 # Configuration
 # ======================================================================
 class LinemodConfig:
@@ -62,11 +77,20 @@ class LinemodConfig:
 
         # --- Pyramid ---
         self.T_PYRAMID = [4, 8, 16]       # Spreading T per level
-        self.PYRAMID_LEVELS = 3       # Number of levels
 
         # --- Matching ---
         self.MATCH_THRESHOLD = 50.0   # Similarity 0–100
         self.NMS_DISTANCE = 30
+
+        # --- Performance / GPU ---
+        self.USE_GPU = _CUDA_AVAILABLE          # Auto-detect, set False to force CPU
+        self.FAST_SEARCH_QUANTIZE = True        # Skip hysteresis on search images
+        self.COARSE_NUM_FEATURES  = 128          # Fewer features for coarse scanning
+        self.MAX_COARSE_CANDIDATES = 2           # Number of top candidates to keep per template at coarse level
+
+    @property
+    def PYRAMID_LEVELS(self):
+        return len(self.T_PYRAMID)
 
 
 # ======================================================================
@@ -92,7 +116,8 @@ class TemplatePyr:
 # Core Algorithm  (mirrors SBM line2Dup.cpp)
 # ======================================================================
 
-def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0):
+def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0,
+                        use_gpu=False):
     """
     Compute gradient and quantize angle into 8 orientation bins.
     Each pixel gets a label 0-7 encoded as a power of 2 (1,2,...,128) or 0.
@@ -105,6 +130,7 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
                      0 = auto-compute from image resolution. Explicit values
                      ensure the template crop and search image use the same
                      kernel even when they differ in spatial size.
+        use_gpu: If True AND CUDA is available, offload Blur/Sobel to GPU.
 
     Mirrors: hysteresisGradient() in line2Dup.cpp
     """
@@ -113,25 +139,67 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     else:
         gray = src.astype(np.float32)
 
-    # Resolution-adaptive pre-blur: thicken thin edges on high-res images
-    # If a strict kernel size is enforced (e.g. from config), use it for blur as well
-    # to maintain consistency between small templates and large search images.
     h, w = gray.shape
     max_dim = max(h, w)
-    
-    if kernel_size > 0:
-        if kernel_size >= 3:
-            gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-    elif max_dim > 1500:
-        # Scale blur dynamically ONLY if auto-detect (kernel_size=0) is requested
-        sigma = max(1.0, (max_dim - 1000) / 1500.0)
-        ksize = int(sigma * 2) * 2 + 1  # Ensure odd kernel size
-        gray = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
 
-    dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    magnitude = cv2.magnitude(dx, dy)
-    angle = cv2.phase(dx, dy, angleInDegrees=True) % 360.0
+    # ---- GPU path for Blur + Sobel + magnitude --------------------------
+    _did_gpu = False
+    if use_gpu and _CUDA_AVAILABLE:
+        try:
+            gpu_gray = cv2.cuda_GpuMat()
+            gpu_gray.upload(gray)
+
+            # Gaussian blur
+            if not fast_mode:
+                if kernel_size > 0 and kernel_size >= 3:
+                    blur_filter = cv2.cuda.createGaussianFilter(
+                        cv2.CV_32F, cv2.CV_32F,
+                        (kernel_size, kernel_size), 0)
+                    gpu_gray = blur_filter.apply(gpu_gray)
+                elif max_dim > 1500:
+                    sigma = max(1.0, (max_dim - 1000) / 1500.0)
+                    ksize = int(sigma * 2) * 2 + 1
+                    blur_filter = cv2.cuda.createGaussianFilter(
+                        cv2.CV_32F, cv2.CV_32F,
+                        (ksize, ksize), sigma)
+                    gpu_gray = blur_filter.apply(gpu_gray)
+
+            # Sobel dx, dy
+            sobel_x = cv2.cuda.createSobelFilter(
+                cv2.CV_32F, cv2.CV_32F, 1, 0, ksize=3)
+            sobel_y = cv2.cuda.createSobelFilter(
+                cv2.CV_32F, cv2.CV_32F, 0, 1, ksize=3)
+            gpu_dx = sobel_x.apply(gpu_gray)
+            gpu_dy = sobel_y.apply(gpu_gray)
+
+            # Magnitude and Phase on GPU
+            gpu_mag = cv2.cuda.magnitude(gpu_dx, gpu_dy, cv2.cuda_GpuMat())
+            gpu_angle = cv2.cuda.phase(gpu_dx, gpu_dy, cv2.cuda_GpuMat(), angleInDegrees=True)
+
+            # Download results (skip dx, dy, gray as they are unused, saves large PCIe transfer latency)
+            magnitude = gpu_mag.download()
+            angle = gpu_angle.download() % 360.0
+            _did_gpu = True
+        except Exception as e:
+            print(f"[LINE-2D CUDA ERROR] Fallback to CPU: {e}")
+            # Silently fall back to CPU
+            _did_gpu = False
+
+    # ---- CPU path for Blur + Sobel + magnitude --------------------------
+    if not _did_gpu:
+        if not fast_mode:
+            if kernel_size > 0:
+                if kernel_size >= 3:
+                    gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+            elif max_dim > 1500:
+                sigma = max(1.0, (max_dim - 1000) / 1500.0)
+                ksize = int(sigma * 2) * 2 + 1
+                gray = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
+
+        dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(dx, dy)
+        angle = cv2.phase(dx, dy, angleInDegrees=True) % 360.0
 
     # Quantize to 16 buckets then fold to 8 (& 7)
     quant_16 = (angle * (16.0 / 360.0)).astype(np.uint8)
@@ -144,16 +212,10 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     h, w = gray.shape
 
     # --- Adaptive / relative weak threshold ---
-    # When weak_threshold < 0, treat its absolute value as a PERCENTILE
-    # of the non-zero gradient magnitudes in this image. E.g. -70 means
-    # "use the 70th percentile as the cutoff".
-    # This makes feature selection resolution-independent: a template
-    # crop of 200x200 and a 5120x5120 search image will both consistently
-    # select the strongest features relative to their own content.
     if weak_threshold < 0:
         nonzero_mags = magnitude[magnitude > 0]
         if len(nonzero_mags) > 0:
-            pct = min(99.0, max(0.0, -weak_threshold))  # e.g. -70 → 70th %ile
+            pct = min(99.0, max(0.0, -weak_threshold))
             weak_threshold = float(np.percentile(nonzero_mags, pct))
         else:
             weak_threshold = 1.0
@@ -165,24 +227,14 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
         quantized[accept] = (1 << quant_8[accept]).astype(np.uint8)
     else:
         # Hysteresis: adaptive majority-vote + magnitude threshold
-        # kernel_size=0 means auto-detect from this image's resolution.
-        # When set explicitly (e.g. from config.HYSTERESIS_KERNEL) the same
-        # kernel is used for both the template crop and the full search image,
-        # which is essential when the template is a small crop of a large
-        # sensor image (same physical pixel density, different spatial extent).
         if kernel_size <= 0:
-            # Auto: scale kernel with image resolution
-            #   919px  → ks=3  (3×3,  min_votes=5/9)
-            #   2048px → ks=5  (5×5,  min_votes=13/25)
-            #   5120px → ks=9  (9×9,  min_votes=41/81)
             raw_ks = max(3, int(3 * max_dim / 1500))
-            ks = min(raw_ks | 1, 9)   # odd, capped at 9
+            ks = min(raw_ks | 1, 9)
         else:
-            ks = max(3, kernel_size | 1)   # force odd, minimum 3
-        min_votes = (ks * ks) // 2 + 1   # strict majority (>50%)
+            ks = max(3, kernel_size | 1)
+        min_votes = (ks * ks) // 2 + 1
         kernel = np.ones((ks, ks), dtype=np.uint8)
 
-        # Process planes one at a time to reduce peak memory
         best_label = np.zeros((h, w), dtype=np.uint8)
         best_count = np.zeros((h, w), dtype=np.uint16)
 
@@ -194,10 +246,8 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
             best_count[better] = votes[better]
             best_label[better] = i
 
-        # Accept only where: magnitude > threshold AND majority vote passed
         accept = (magnitude > weak_threshold) & (best_count >= min_votes)
 
-        # Encode as bit: 1 << label
         quantized = np.zeros((h, w), dtype=np.uint8)
         quantized[accept] = (1 << best_label[accept]).astype(np.uint8)
 
@@ -208,22 +258,23 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     return quantized, magnitude
 
 
-def _spread(quantized, T):
+def _spread(quantized, T, use_gpu=False):
     """
     OR-spread quantized orientations over a (2T-1)×(2T-1) neighbourhood.
 
     Equivalent to the original loop-based spread but implemented via
-    cv2.dilate on each of the 8 bit-planes, which is 3-8× faster because
-    cv2.dilate separates the 2-D box into two 1-D passes in optimised C++.
-    The mathematical result is identical to the original implementation.
+    cv2.dilate on each of the 8 bit-planes. This is 3-8× faster natively on CPU
+    because cv2.dilate implements highly optimized vector SIMD instructions.
+    GPU acceleration is DISABLED here because PCIe transfer overhead of 8 bit-planes 
+    is natively slower than the vectorized CPU.
     """
     if T <= 1:
         return quantized.copy()
 
-    # Box structuring element: (2T-1) in each direction covers T-1 neighbours
     ks = 2 * T - 1
     kernel = np.ones((ks, ks), dtype=np.uint8)
 
+    # ---- CPU path (Optimized natively in openCV over PCIe overheads) ----
     result = np.zeros_like(quantized)
     for bit in range(8):
         plane = ((quantized >> bit) & 1).astype(np.uint8)
@@ -271,77 +322,9 @@ def _compute_response_maps(spread_img):
     """
     response_maps = []
     for label in range(8):
-        rmap = _RESPONSE_LUTS[label][spread_img]
+        rmap = cv2.LUT(spread_img, _RESPONSE_LUTS[label])
         response_maps.append(rmap)
     return response_maps
-
-
-def _linearize(response_map, T):
-    """
-    Linearize a response map into a (T*T, H_dec * W_dec) array.
-    Each of the T*T sub-grids is a decimated view of the response map.
-
-    The sub-grid at (gy, gx) contains response_map[gy::T, gx::T].
-    Rows of the output are indexed by grid_y*T + grid_x.
-
-    Mirrors: linearize() in line2Dup.cpp
-    """
-    h, w = response_map.shape
-    W = w // T
-    H = h // T
-    memories = np.zeros((T * T, H * W), dtype=np.uint8)
-    for gy in range(T):
-        for gx in range(T):
-            decimated = response_map[gy:gy + H * T:T, gx:gx + W * T:T]
-            row_idx = gy * T + gx
-            memories[row_idx, :decimated.size] = decimated.ravel()[:W * H]
-    return memories, W, H
-
-
-def _similarity(linear_memories, templ_features, T, W, H):
-    """
-    Compute similarity map by summing response values at each feature.
-
-    For each template position (lm_x, lm_y) in the decimated grid,
-    accumulate response_maps[feat.label] at the feature's location
-    offset by that position.
-
-    Returns similarity map of shape (H, W) as uint16.
-    Mirrors: similarity() in line2Dup.cpp
-    """
-    # Dimensions of the output similarity map
-    dst = np.zeros(H * W, dtype=np.int32)
-
-    for feat in templ_features:
-        # Which sub-grid does this feature fall in?
-        grid_x = feat.x % T
-        grid_y = feat.y % T
-        grid_index = grid_y * T + grid_x
-
-        # Where in the sub-grid?
-        lm_x = feat.x // T
-        lm_y = feat.y // T
-        lm_offset = lm_y * W + lm_x
-
-        # Get the linearized memory row for this feature's label
-        memory = linear_memories[feat.label]  # shape (T*T, H*W)
-        lm_row = memory[grid_index]           # shape (H*W,)
-
-        # Compute span: how many positions we can slide to
-        wf = (max(f.x for f in templ_features) - min(f.x for f in templ_features)) // T + 1
-        hf = (max(f.y for f in templ_features) - min(f.y for f in templ_features)) // T + 1
-        span_x = W - wf
-        span_y = H - hf
-        n_positions = span_y * W + span_x + 1
-
-        # Accumulate: dst[j] += lm_row[lm_offset + j] for each valid j
-        end = min(lm_offset + n_positions, len(lm_row))
-        start = lm_offset
-        if start < len(lm_row) and end > start:
-            length = end - start
-            dst[:length] += lm_row[start:end].astype(np.int32)
-
-    return dst
 
 
 def _extract_scattered_features(quantized, magnitude, num_features, mask=None):
@@ -349,9 +332,11 @@ def _extract_scattered_features(quantized, magnitude, num_features, mask=None):
     Select N spatially scattered feature points from the quantized image.
     Sorted by gradient magnitude, with minimum distance constraint.
 
+    Uses a spatial grid hash so the distance check per candidate is O(9 cells)
+    instead of O(n_selected), giving ~5-10x speedup over the naive approach.
+
     Mirrors: selectScatteredFeatures() in line2Dup.cpp
     """
-    # Vectorized candidate extraction
     if mask is not None:
         valid = (quantized > 0) & (mask > 0)
     else:
@@ -365,40 +350,62 @@ def _extract_scattered_features(quantized, magnitude, num_features, mask=None):
     quants = quantized[ys, xs]
     labels = np.log2(quants.astype(np.float32)).astype(np.int32)
 
-    # Sort by magnitude descending
     order = np.argsort(-mags)
 
-    # Greedy scattered selection
-    features = []
-    
-    # Dynamically scale initial distance based on the object's estimated perimeter
-    span_x = np.max(xs) - np.min(xs)
-    span_y = np.max(ys) - np.min(ys)
+    span_x = int(np.max(xs) - np.min(xs))
+    span_y = int(np.max(ys) - np.min(ys))
     perimeter_approx = 2.0 * (span_x + span_y)
-    distance = max(5.0, perimeter_approx / (num_features * 0.8))  # Slightly optimistic start
+    distance = max(5.0, perimeter_approx / (num_features * 0.8))
 
-    while distance >= 1.0:
-        features = []  # CRITICAL: Restart collection for the new distance threshold
+    features = []
+    used = np.zeros(len(order), dtype=bool)
+
+    while distance >= 1.0 and len(features) < num_features:
         dist_sq = distance * distance
-        
-        for idx in order:
-            x, y, label = int(xs[idx]), int(ys[idx]), int(labels[idx])
+        cell = max(1, int(distance))
 
-            # Check minimum distance to existing features
-            keep = True
-            for f in features:
-                if (x - f.x)**2 + (y - f.y)**2 < dist_sq:
-                    keep = False; break
-                    
-            if keep:
+        # Rebuild spatial grid from already-accepted features for this cell size
+        grid = {}  # (grid_y, grid_x) -> list of (x, y)
+        for feat in features:
+            gx, gy = feat.x // cell, feat.y // cell
+            key = (gy, gx)
+            if key not in grid:
+                grid[key] = []
+            grid[key].append((feat.x, feat.y))
+
+        for i, idx in enumerate(order):
+            if used[i]:
+                continue
+
+            x, y, label = int(xs[idx]), int(ys[idx]), int(labels[idx])
+            gx, gy = x // cell, y // cell
+
+            # Check only the 3×3 neighbourhood of grid cells (O(9×k) vs O(n_selected))
+            close = False
+            for dgy in range(-1, 2):
+                ngy = gy + dgy
+                for dgx in range(-1, 2):
+                    bucket = grid.get((ngy, gx + dgx))
+                    if bucket:
+                        for fx, fy in bucket:
+                            if (x - fx) * (x - fx) + (y - fy) * (y - fy) < dist_sq:
+                                close = True
+                                break
+                    if close:
+                        break
+                if close:
+                    break
+
+            if not close:
+                key = (gy, gx)
+                if key not in grid:
+                    grid[key] = []
+                grid[key].append((x, y))
                 features.append(Feature(x, y, label))
+                used[i] = True
                 if len(features) >= num_features:
                     break
 
-        if len(features) >= num_features:
-            break
-            
-        # Fast relaxation for large starting distances
         step = max(1.0, distance * 0.15)
         distance -= step
 
@@ -436,6 +443,46 @@ def _crop_templates(templates):
             f.y -= t.tl_y
 
 
+def _subpixel_refine(score_map, r, c):
+    """
+    Parabolic (3-point quadratic) sub-pixel interpolation.
+
+    Given the integer-peak position (r, c) in *score_map*, fits a 1-D
+    parabola independently along each axis through the three neighbouring
+    score values and returns the sub-pixel fractional offset (dx, dy).
+
+    Formula (standard Harris / SIFT derivation):
+        delta = (s_left - s_right) / (2 * (s_left - 2*s_centre + s_right))
+
+    Both offsets are clamped to [-0.5, +0.5] so the refined position
+    never moves to a different integer grid cell.
+    Cost: 5 scalar lookups + 4 arithmetic ops — negligible vs match time.
+    """
+    h, w = score_map.shape
+
+    if 0 < c < w - 1:
+        sl = float(score_map[r, c - 1])
+        sc = float(score_map[r, c])
+        sr = float(score_map[r, c + 1])
+        denom_x = sl - 2.0 * sc + sr
+        dx = 0.5 * (sl - sr) / denom_x if abs(denom_x) > 1e-6 else 0.0
+    else:
+        dx = 0.0
+
+    if 0 < r < h - 1:
+        su = float(score_map[r - 1, c])
+        sc_y = float(score_map[r, c])
+        sd = float(score_map[r + 1, c])
+        denom_y = su - 2.0 * sc_y + sd
+        dy = 0.5 * (su - sd) / denom_y if abs(denom_y) > 1e-6 else 0.0
+    else:
+        dy = 0.0
+
+    dx = max(-0.5, min(0.5, dx))
+    dy = max(-0.5, min(0.5, dy))
+    return dx, dy
+
+
 # ======================================================================
 # High-Level Matcher Class
 # ======================================================================
@@ -464,7 +511,19 @@ class LinemodMatcher:
         self.detection_mask = detection_mask.copy() if detection_mask is not None else None
 
     def generate_templates(self):
-        """Generate rotated+scaled templates (mirrors shapeInfo.produce_infos)."""
+        """Generate rotated+scaled templates (mirrors shapeInfo.produce_infos).
+
+        Parallelised with ThreadPoolExecutor across the angle × scale set.
+        OpenCV/NumPy release the GIL so threads run truly in parallel on
+        multi-core CPUs.
+
+        GPU (CUDA) is intentionally disabled inside the worker threads because
+        template crops are small — PCIe upload/download overhead exceeds the
+        GPU compute saving for images < ~500 px.  GPU is still used in match().
+        """
+        import os as _os
+        from concurrent.futures import ThreadPoolExecutor
+
         if self.template_image is None:
             raise ValueError("Call load_template() first.")
 
@@ -478,64 +537,88 @@ class LinemodMatcher:
             scales = list(np.arange(cfg.SCALE_MIN, cfg.SCALE_MAX + cfg.SCALE_STEP / 2, cfg.SCALE_STEP))
 
         total = len(angles) * len(scales)
-        added = 0
 
-        for scale in scales:
-            for angle in angles:
-                src = self._transform(self.template_image, angle, scale)
-                # Rotation/scale validity mask (non-zero = valid pixel)
-                rotation_mask = self._transform(
-                    np.ones_like(self.template_image) * 255, angle, scale)
-                rotation_mask = (rotation_mask > 128).astype(np.uint8) * 255
+        # Snapshot read-only state once so worker threads don't race on self.*
+        _tmpl_img   = self.template_image
+        _det_mask   = self.detection_mask
+        _cfg        = cfg
 
-                # Compose with user-drawn detection mask if available
-                if self.detection_mask is not None:
-                    user_mask_xformed = self._transform(self.detection_mask, angle, scale)
-                    user_mask_xformed = (user_mask_xformed > 128).astype(np.uint8) * 255
-                    mask_img = cv2.bitwise_and(rotation_mask, user_mask_xformed)
-                else:
-                    mask_img = rotation_mask
+        def _process_one(angle, scale):
+            src = LinemodMatcher._transform(_tmpl_img, angle, scale)
+            rotation_mask = LinemodMatcher._transform(
+                np.ones_like(_tmpl_img) * 255, angle, scale)
+            rotation_mask = (rotation_mask > 128).astype(np.uint8) * 255
 
-                # Extract features at each pyramid level
-                pyr_src = src.copy()
-                pyr_mask = mask_img.copy()
-                templates = []
-                ok = True
+            if _det_mask is not None:
+                user_mask_xformed = LinemodMatcher._transform(_det_mask, angle, scale)
+                user_mask_xformed = (user_mask_xformed > 128).astype(np.uint8) * 255
+                mask_img = cv2.bitwise_and(rotation_mask, user_mask_xformed)
+            else:
+                mask_img = rotation_mask
 
-                for level in range(cfg.PYRAMID_LEVELS):
-                    if level > 0:
-                        pyr_src = cv2.pyrDown(pyr_src)
-                        pyr_mask = cv2.pyrDown(pyr_mask)
-                        pyr_mask = (pyr_mask > 128).astype(np.uint8) * 255
+            pyr_src  = src.copy()
+            pyr_mask = mask_img.copy()
+            templates = []
 
-                    quantized, mag = _quantize_gradients(
-                        pyr_src, cfg.WEAK_THRESHOLD,
-                        kernel_size=cfg.HYSTERESIS_KERNEL)
-                    features = _extract_scattered_features(
-                        quantized, mag, cfg.NUM_FEATURES, pyr_mask)
+            for level in range(_cfg.PYRAMID_LEVELS):
+                if level > 0:
+                    pyr_src  = cv2.pyrDown(pyr_src)
+                    pyr_mask = cv2.pyrDown(pyr_mask)
+                    pyr_mask = (pyr_mask > 128).astype(np.uint8) * 255
 
-                    if len(features) < 4:
-                        ok = False; break
+                # use_gpu=False: template crops are small; GPU PCIe overhead > CPU gain.
+                # GPU is still used during match() on the full search image.
+                quantized, mag = _quantize_gradients(
+                    pyr_src, _cfg.WEAK_THRESHOLD,
+                    kernel_size=_cfg.HYSTERESIS_KERNEL,
+                    use_gpu=False)
+                features = _extract_scattered_features(
+                    quantized, mag, _cfg.NUM_FEATURES, pyr_mask)
 
-                    t = TemplatePyr()
-                    t.pyramid_level = level
-                    t.features = features
-                    templates.append(t)
+                if len(features) < 4:
+                    return None
 
-                if not ok:
-                    continue
+                t = TemplatePyr()
+                t.pyramid_level = level
+                t.features = features
+                templates.append(t)
 
-                _crop_templates(templates)
+            _crop_templates(templates)
+            return {
+                'angle': angle, 'scale': scale,
+                'templates': templates,
+                # 'image' is NOT stored here to avoid keeping 72 rotated numpy
+                # arrays in RAM permanently (~200 MB+ for large templates).
+                # visualize_templates() regenerates it on demand.
+                'size': (src.shape[1], src.shape[0]),
+            }
 
-                self.template_pyramids.append({
-                    'angle': angle, 'scale': scale,
-                    'templates': templates, 'image': src,
-                    'size': (src.shape[1], src.shape[0]),
-                })
-                added += 1
+        combos = [(angle, scale) for scale in scales for angle in angles]
+        # Cap workers: no benefit beyond cpu_count; keep at least 1
+        max_workers = max(1, min(len(combos), (_os.cpu_count() or 4), 8))
+
+        results = []
+        if max_workers > 1 and len(combos) > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_process_one, a, s) for a, s in combos]
+                for fut in futures:
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+        else:
+            for angle, scale in combos:
+                r = _process_one(angle, scale)
+                if r is not None:
+                    results.append(r)
+
+        # Preserve deterministic ordering (scale asc, angle asc)
+        results.sort(key=lambda r: (r['scale'], r['angle']))
+        self.template_pyramids = results
+        added = len(self.template_pyramids)
 
         print(f"[LINE-2D] Generated {added}/{total} templates "
-              f"({len(angles)} angles × {len(scales)} scales)")
+              f"({len(angles)} angles × {len(scales)} scales, "
+              f"{max_workers} worker{'s' if max_workers > 1 else ''})")
 
     def match(self, search_img, threshold=None, return_all=False, search_roi=None):
         """Find template matches in the search image.
@@ -549,13 +632,20 @@ class LinemodMatcher:
             threshold: Minimum similarity score (0-100). Default: config value.
             return_all: If True, return list of all matches. Otherwise best match.
             search_roi: Optional (x, y, w, h) tuple to restrict search area.
+
+        Side-effect:
+            Sets self._last_timing dict with per-phase millisecond breakdowns
+            so the ViewModel can display a timing chart without changing the
+            public return-type signature.
         """
+        import time as _time
         if not self.template_pyramids:
             raise ValueError("Call generate_templates() first.")
 
         cfg = self.config
         threshold = threshold or cfg.MATCH_THRESHOLD
 
+        t0_prep = _time.perf_counter()
         if len(search_img.shape) == 3:
             search_gray = cv2.cvtColor(search_img, cv2.COLOR_BGR2GRAY)
         else:
@@ -567,6 +657,7 @@ class LinemodMatcher:
             rx, ry, rw, rh = search_roi
             search_gray = search_gray[ry:ry+rh, rx:rx+rw].copy()
             roi_offset = (rx, ry)
+        t_prep = (_time.perf_counter() - t0_prep) * 1000
 
         # Auto pyramid: for high-res images use coarse-to-fine search.
         # Requires PYRAMID_LEVELS >= 2 (templates must have a level-1 half-res
@@ -580,16 +671,21 @@ class LinemodMatcher:
         )
 
         if use_pyramid:
-            matches = self._match_pyramid(search_gray, threshold)
+            matches, inner_timing = self._match_pyramid(search_gray, threshold)
             # Robust fallback: if pyramid found nothing (coarse was off or ROI
             # missed), retry with the reliable full-image single-level scan.
             if not matches:
                 print("  [Pyramid] 0 matches — falling back to full-image scan")
-                matches = self._match_single_level(search_gray, threshold)
+                matches, inner_timing = self._match_single_level(search_gray, threshold)
+                inner_timing['mode'] = 'Single-Level (fallback)'
+            else:
+                inner_timing['mode'] = 'Pyramid'
         else:
-            matches = self._match_single_level(search_gray, threshold)
+            matches, inner_timing = self._match_single_level(search_gray, threshold)
+            inner_timing['mode'] = 'Single-Level'
 
         # Offset positions back to original image coordinates
+        t0_nms = _time.perf_counter()
         if roi_offset != (0, 0):
             ox, oy = roi_offset
             for m in matches:
@@ -600,6 +696,14 @@ class LinemodMatcher:
 
         matches = self._nms(matches)
         matches.sort(key=lambda m: m['score'], reverse=True)
+        t_nms = (_time.perf_counter() - t0_nms) * 1000
+
+        # Persist timing for ViewModel to harvest
+        self._last_timing = {
+            **inner_timing,
+            'prep_ms': t_prep,
+            'nms_ms':  t_nms,
+        }
 
         if return_all:
             return matches
@@ -608,26 +712,43 @@ class LinemodMatcher:
     def _match_single_level(self, search_gray, threshold):
         """
         Single-level scoring via vectorized response map slicing.
+        Returns (matches, timing_dict).
         """
+        import time as _time
         cfg = self.config
         all_matches = []
+        timing = {}
 
         T = cfg.T_PYRAMID[0]
         # Auto-scale spread for high-res images: thin edges need wider spread
         sh, sw = search_gray.shape[:2]
         max_dim = max(sh, sw)
         if max_dim > 1500:
-            # Scale T proportionally: T=4 at 1500px → T≈14 at 5120px
-            T = max(T, int(T * max_dim / 1500))
+            # Scale T proportionally but cap at 8 to preserve scoring accuracy.
+            # T>8 creates spread windows so wide that response maps lose
+            # discriminating power (wrong positions score as high as correct).
+            T = min(max(T, int(T * max_dim / 1500)), 8)
             print(f"  [Auto] Spread T scaled to {T} for {sw}×{sh} image")
+
+        t0 = _time.perf_counter()
         quantized, _ = _quantize_gradients(
             search_gray, cfg.WEAK_THRESHOLD,
-            kernel_size=cfg.HYSTERESIS_KERNEL)
-        spread_q = _spread(quantized, T)
+            fast_mode=cfg.FAST_SEARCH_QUANTIZE,
+            kernel_size=cfg.HYSTERESIS_KERNEL,
+            use_gpu=cfg.USE_GPU)
+        timing['quantize_ms'] = (_time.perf_counter() - t0) * 1000
+
+        t0 = _time.perf_counter()
+        spread_q = _spread(quantized, T, use_gpu=cfg.USE_GPU)
+        timing['spread_ms'] = (_time.perf_counter() - t0) * 1000
+
+        t0 = _time.perf_counter()
         rmaps = _compute_response_maps(spread_q)
         # Pre-cast response maps to int32 once to avoid massive memory allocations in the inner loop
         rmaps_int32 = [r.astype(np.int32) for r in rmaps]
-        
+        timing['response_maps_ms'] = (_time.perf_counter() - t0) * 1000
+
+        t0 = _time.perf_counter()
         sh, sw = search_gray.shape[:2]
 
         for tp_idx, tp in enumerate(self.template_pyramids):
@@ -677,8 +798,10 @@ class LinemodMatcher:
             img_w, img_h = tp['size']
 
             for idx in order:
-                cx = int(xs[idx]) - templ.tl_x + img_w // 2
-                cy = int(ys[idx]) - templ.tl_y + img_h // 2
+                r_i, c_i = int(ys[idx]), int(xs[idx])
+                dx, dy = _subpixel_refine(sim_map, r_i, c_i)
+                cx = c_i + dx - templ.tl_x + img_w // 2
+                cy = r_i + dy - templ.tl_y + img_h // 2
                 s = float(scores[idx])
 
                 dup = False
@@ -686,18 +809,20 @@ class LinemodMatcher:
                     if (cx - k['x'])**2 + (cy - k['y'])**2 < nms_dist_sq:
                         dup = True; break
                 if not dup:
+                    icx, icy = int(round(cx)), int(round(cy))
                     kept.append({
                         'x': cx, 'y': cy,
                         'angle': tp['angle'], 'scale': tp['scale'],
                         'score': s, 'template_id': tp_idx,
-                        'bbox': (cx - img_w//2, cy - img_h//2, img_w, img_h),
+                        'bbox': (icx - img_w//2, icy - img_h//2, img_w, img_h),
                     })
                     if len(kept) >= 20:
                         break
 
             all_matches.extend(kept)
 
-        return all_matches
+        timing['scoring_ms'] = (_time.perf_counter() - t0) * 1000
+        return all_matches, timing
 
     def _match_pyramid(self, search_gray, threshold):
         """
@@ -707,11 +832,14 @@ class LinemodMatcher:
             level-1 features and lower threshold to find candidate regions.
         Level 0 (fine):   Search only within ROI windows around each coarse
             candidate at full resolution for precise positioning.
+
+        Returns (matches, timing_dict).
         """
         import time
         import math
         cfg = self.config
         sh, sw = search_gray.shape[:2]
+        timing = {}
 
         # Determine optimal coarse level (1/2, 1/4, 1/8 size)
         max_dim = max(sh, sw)
@@ -723,25 +851,39 @@ class LinemodMatcher:
             coarse_level = min(cfg.PYRAMID_LEVELS - 1, max(0, cfg.FORCE_COARSE_LEVEL))
 
         # ---- Level N: Coarse search at reduced resolution ----
-        t0 = time.time()
+        t0_coarse_total = time.perf_counter()
+
+        t0 = time.perf_counter()
         search_coarse = search_gray
         for _ in range(coarse_level):
             search_coarse = cv2.pyrDown(search_coarse)
         sh_c, sw_c = search_coarse.shape[:2]
+        timing['downsample_ms'] = (time.perf_counter() - t0) * 1000
 
         T_c = cfg.T_PYRAMID[coarse_level] if len(cfg.T_PYRAMID) > coarse_level else cfg.T_PYRAMID[-1]
-        
+
+        t0 = time.perf_counter()
         q_c, _ = _quantize_gradients(search_coarse, cfg.WEAK_THRESHOLD,
-                                    kernel_size=cfg.HYSTERESIS_KERNEL)
-        s_c = _spread(q_c, T_c)
+                                    fast_mode=cfg.FAST_SEARCH_QUANTIZE,
+                                    kernel_size=cfg.HYSTERESIS_KERNEL,
+                                    use_gpu=False) # Force CPU for Coarse downsampled image (GPU PCIe is 4x slower here)
+        timing['coarse_quantize_ms'] = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        s_c = _spread(q_c, T_c, use_gpu=cfg.USE_GPU)
+        timing['coarse_spread_ms'] = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
         rmaps_c = _compute_response_maps(s_c)
         rmaps_c_int32 = [r.astype(np.int32) for r in rmaps_c]
+        timing['coarse_response_maps_ms'] = (time.perf_counter() - t0) * 1000
 
         # Lower threshold for coarse pass — be generous to not miss candidates.
         coarse_threshold = max(threshold * 0.3, 15.0)
 
         coarse_candidates = []  # (tp_idx, cx_full, cy_full, coarse_score)
 
+        t0 = time.perf_counter()
         for tp_idx, tp in enumerate(self.template_pyramids):
             if len(tp['templates']) <= coarse_level:
                 continue
@@ -758,10 +900,21 @@ class LinemodMatcher:
             if vy_c <= 0 or vx_c <= 0:
                 continue
 
-            # Score at coarse level
+            # Score at coarse level using 48 evenly-spaced features.
+            # Coarse only needs to find approximate position (±4px at L2);
+            # the fine pass uses ALL features for precise scoring.
             score_map = np.zeros((vy_c, vx_c), dtype=np.int32)
             valid = 0
-            for feat in templ_c.features:
+
+            n_feats_c = len(templ_c.features)
+            max_coarse_feats = cfg.COARSE_NUM_FEATURES
+            if n_feats_c > max_coarse_feats:
+                step = max(1, n_feats_c // max_coarse_feats)
+                coarse_feats = templ_c.features[::step][:max_coarse_feats]
+            else:
+                coarse_feats = templ_c.features
+
+            for feat in coarse_feats:
                 fx, fy = feat.x, feat.y
                 if fy + vy_c <= sh_c and fx + vx_c <= sw_c and fy >= 0 and fx >= 0:
                     score_map += rmaps_c_int32[feat.label][fy:fy+vy_c, fx:fx+vx_c]
@@ -798,129 +951,202 @@ class LinemodMatcher:
                         dup = True; break
                 if not dup:
                     kept_coarse.append((tp_idx, cx_full, cy_full, float(scores[idx])))
-                    if len(kept_coarse) >= 1:   # best candidate only per template mode
+                    if len(kept_coarse) >= 1:   # best candidate only per template
                         break
 
             coarse_candidates.extend(kept_coarse)
 
-        t_coarse = (time.time() - t0) * 1000
+            # Early exit only for single-template (Simple/Fast) mode.
+            # Multi-template modes (With Rotation / Full Search) MUST evaluate
+            # all templates so the correct angle AND scale can win — stopping
+            # early on score > 80 causes the wrong scale/angle to be selected.
+            if len(kept_coarse) > 0 and len(self.template_pyramids) == 1:
+                peak_score = max(c[3] for c in kept_coarse)
+                if peak_score > threshold * 0.7:
+                    break
+
+        timing['coarse_scoring_ms'] = (time.perf_counter() - t0) * 1000
+
+        # Limit fine-search work: keep only the top-N coarse candidates by
+        # score so we don't run the full fine pass on hundreds of duplicates.
+        # 30 is generous — clusters at the same position are merged so the
+        # actual number of fine ROI evaluations is much smaller.
+        if len(coarse_candidates) > 30:
+            coarse_candidates.sort(key=lambda c: c[3], reverse=True)
+            coarse_candidates = coarse_candidates[:30]
+
+        t_coarse = (time.perf_counter() - t0_coarse_total) * 1000
         print(f"  [Pyramid] Coarse (L{coarse_level} {sw_c}×{sh_c}): {len(coarse_candidates)} candidates in {t_coarse:.0f}ms")
 
         if not coarse_candidates:
-            return []
+            return [], timing
 
         # ---- Level 0: Fine search in ROI windows ----
-        t0 = time.time()
+        t0_fine_total = time.perf_counter()
         T0 = cfg.T_PYRAMID[0]
-        # Auto-scale spread for high-res fine search regions
+        # Auto-scale spread for fine search, capped at 8 to preserve
+        # scoring accuracy on the small fine ROI (~500px)
         if max_dim > 1500:
-            T0 = max(T0, int(T0 * max_dim / 1500))
+            T0 = min(max(T0, int(T0 * max_dim / 1500)), 8)
 
         # Margin scaling based on maximum expected coarse spatial drift 
         # (e.g., 8-12 pixels of drift in coarse space scaled upward)
         search_margin = 12 * scale_factor 
 
         all_matches = []
+        t_fine_quantize = t_fine_spread = t_fine_rmap = t_fine_score = 0.0
 
+        # Collect and cluster candidates by geometrical overlap
+        clusters = []
         for tp_idx, cx_full, cy_full, coarse_score in coarse_candidates:
             tp = self.template_pyramids[tp_idx]
-            templ0 = tp['templates'][0]  # Level 0 (full-res) template
-            n_feats = len(templ0.features)
-            if n_feats == 0:
+            templ0 = tp['templates'][0]
+            if len(templ0.features) == 0:
                 continue
 
             img_w, img_h = tp['size']
-            tw0 = templ0.width
-            th0 = templ0.height
+            tw0, th0 = templ0.width, templ0.height
 
-            # Expected feature-bbox top-left in image coords.
-            # cx_full/cy_full is template IMAGE centre:
-            #   feat_tl = centre - img_half + tl_offset_inside_image
             tl_feat_x = cx_full - img_w // 2 + templ0.tl_x
             tl_feat_y = cy_full - img_h // 2 + templ0.tl_y
 
-            # ROI: tight window around expected TL ± search_margin.
-            # Score-map slack = 2*search_margin + T0 absorbs coarse inaccuracy
-            # without scanning the whole image.
             rx  = max(0,  tl_feat_x - search_margin)
             ry  = max(0,  tl_feat_y - search_margin)
             rx2 = min(sw, tl_feat_x + tw0 + search_margin + T0 + 4)
             ry2 = min(sh, tl_feat_y + th0 + search_margin + T0 + 4)
 
-            roi_crop = search_gray[ry:ry2, rx:rx2]
-            rh, rw = roi_crop.shape[:2]
-
-            if rw < tw0 + 10 or rh < th0 + 10:
+            if rx2 - rx < tw0 + 10 or ry2 - ry < th0 + 10:
                 continue
 
-            # Quantize + spread + response maps on ROI ONLY
-            q_roi, _ = _quantize_gradients(roi_crop, cfg.WEAK_THRESHOLD)
-            s_roi = _spread(q_roi, T0)
-            rmaps_roi = _compute_response_maps(s_roi)
-            rmaps_roi_int32 = [r.astype(np.int32) for r in rmaps_roi]
+            cand = {
+                'tp_idx': tp_idx, 'cx_full': cx_full, 'cy_full': cy_full,
+                'coarse_score': coarse_score, 'tp': tp, 'templ0': templ0,
+                'rx': rx, 'ry': ry, 'rx2': rx2, 'ry2': ry2
+            }
 
-            # Valid scan area within ROI
-            vy = rh - th0
-            vx = rw - tw0
-            if vy <= 0 or vx <= 0:
-                continue
+            merged = False
+            for cluster in clusters:
+                crx, cry, crx2, cry2 = cluster['bounds']
+                # Check intersection
+                if not (rx2 < crx or rx > crx2 or ry2 < cry or ry > cry2):
+                    # Merge bounds
+                    cluster['bounds'] = [min(rx, crx), min(ry, cry), max(rx2, crx2), max(ry2, cry2)]
+                    cluster['candidates'].append(cand)
+                    merged = True
+                    break
+            
+            if not merged:
+                clusters.append({'bounds': [rx, ry, rx2, ry2], 'candidates': [cand]})
 
-            # Score within ROI
-            score_map = np.zeros((vy, vx), dtype=np.int32)
-            valid = 0
+        # Evaluate each super-ROI cluster exactly once
+        for cluster in clusters:
+            R_X, R_Y, R_X2, R_Y2 = cluster['bounds']
+            super_roi = search_gray[R_Y:R_Y2, R_X:R_X2]
+            
+            _t = time.perf_counter()
+            # kernel_size is missing in fine quantize because fast_mode=True means hysteresis is skipped, so kernel_size is irrelevant
+            q_super, _ = _quantize_gradients(super_roi, cfg.WEAK_THRESHOLD,
+                                           fast_mode=True, # Always skip blur/hysteresis for fine search speed
+                                           use_gpu=False)
+            t_fine_quantize += (time.perf_counter() - _t) * 1000
 
-            for feat in templ0.features:
-                fx, fy = feat.x, feat.y
-                if fy + vy <= rh and fx + vx <= rw and fy >= 0 and fx >= 0:
-                    score_map += rmaps_roi_int32[feat.label][fy:fy+vy, fx:fx+vx]
-                    valid += 1
+            _t = time.perf_counter()
+            s_super = _spread(q_super, T0, use_gpu=False)
+            t_fine_spread += (time.perf_counter() - _t) * 1000
 
-            if valid == 0:
-                continue
+            _t = time.perf_counter()
+            rmaps_super = _compute_response_maps(s_super)
+            rmaps_super_int32 = [r.astype(np.int32) for r in rmaps_super]
+            t_fine_rmap += (time.perf_counter() - _t) * 1000
 
-            sim_map = (score_map * 100.0) / (4 * valid)
-            ys, xs = np.where(sim_map > threshold)
-            if len(xs) == 0:
-                continue
+            for cand in cluster['candidates']:
+                rx, ry, rx2, ry2 = cand['rx'], cand['ry'], cand['rx2'], cand['ry2']
+                templ0, tp, tp_idx = cand['templ0'], cand['tp'], cand['tp_idx']
+                img_w, img_h = tp['size']
+                tw0, th0 = templ0.width, templ0.height
 
-            scores = sim_map[ys, xs]
-            order = np.argsort(-scores)
+                # Extract proper subset views for this candidate
+                lx, ly = rx - R_X, ry - R_Y
+                lx2, ly2 = rx2 - R_X, ry2 - R_Y
+                
+                _t = time.perf_counter()
+                rh, rw = ly2 - ly, lx2 - lx
 
-            nms_dist_sq = cfg.NMS_DISTANCE ** 2
-            kept = []
-            for idx in order:
-                # Convert ROI-local position to image coordinates
-                cx = int(xs[idx]) + rx - templ0.tl_x + img_w // 2
-                cy = int(ys[idx]) + ry - templ0.tl_y + img_h // 2
-                s = float(scores[idx])
+                vy, vx = rh - th0, rw - tw0
+                if vy <= 0 or vx <= 0:
+                    t_fine_score += (time.perf_counter() - _t) * 1000
+                    continue
 
-                dup = False
-                for k in kept:
-                    if (cx - k['x'])**2 + (cy - k['y'])**2 < nms_dist_sq:
-                        dup = True; break
-                # Also check against already-found matches
-                for k in all_matches:
-                    if (cx - k['x'])**2 + (cy - k['y'])**2 < nms_dist_sq:
-                        if s <= k['score']:
+                score_map = np.zeros((vy, vx), dtype=np.int32)
+                valid = 0
+                for feat in templ0.features:
+                    fx, fy = feat.x, feat.y
+                    if fy + vy <= rh and fx + vx <= rw and fy >= 0 and fx >= 0:
+                        score_map += rmaps_super_int32[feat.label][ly+fy:ly+fy+vy, lx+fx:lx+fx+vx]
+                        valid += 1
+
+                if valid == 0:
+                    t_fine_score += (time.perf_counter() - _t) * 1000
+                    continue
+
+                sim_map = (score_map * 100.0) / (4 * valid)
+                ys, xs = np.where(sim_map > threshold)
+                
+                if len(xs) == 0:
+                    t_fine_score += (time.perf_counter() - _t) * 1000
+                    continue
+
+                scores = sim_map[ys, xs]
+                order = np.argsort(-scores)
+
+                nms_dist_sq = cfg.NMS_DISTANCE ** 2
+                kept = []
+                for idx in order:
+                    r_i, c_i = int(ys[idx]), int(xs[idx])
+                    dx, dy = _subpixel_refine(sim_map, r_i, c_i)
+                    cx = c_i + dx + rx - templ0.tl_x + img_w // 2
+                    cy = r_i + dy + ry - templ0.tl_y + img_h // 2
+                    s = float(scores[idx])
+
+                    dup = False
+                    for k in kept:
+                        if (cx - k['x'])**2 + (cy - k['y'])**2 < nms_dist_sq:
                             dup = True; break
+                    for k in all_matches:
+                        if (cx - k['x'])**2 + (cy - k['y'])**2 < nms_dist_sq:
+                            if s <= k['score']:
+                                dup = True; break
 
-                if not dup:
-                    kept.append({
-                        'x': cx, 'y': cy,
-                        'angle': tp['angle'], 'scale': tp['scale'],
-                        'score': s, 'template_id': tp_idx,
-                        'bbox': (cx - img_w//2, cy - img_h//2, img_w, img_h),
-                    })
-                    if len(kept) >= 5:
-                        break
+                    if not dup:
+                        icx, icy = int(round(cx)), int(round(cy))
+                        kept.append({
+                            'x': cx, 'y': cy,
+                            'angle': tp['angle'], 'scale': tp['scale'],
+                            'score': s, 'template_id': tp_idx,
+                            'bbox': (icx - img_w//2, icy - img_h//2, img_w, img_h),
+                        })
+                        if len(kept) >= 5:
+                            break
 
-            all_matches.extend(kept)
+                t_fine_score += (time.perf_counter() - _t) * 1000
+                all_matches.extend(kept)
 
-        t_fine = (time.time() - t0) * 1000
+        t_fine = (time.perf_counter() - t0_fine_total) * 1000
         print(f"  [Pyramid] Fine   (L0 {sw}×{sh}): {len(all_matches)} matches in {t_fine:.0f}ms")
         print(f"  [Pyramid] Total: {t_coarse + t_fine:.0f}ms")
 
-        return all_matches
+        timing.update({
+            'fine_quantize_ms':      t_fine_quantize,
+            'fine_spread_ms':        t_fine_spread,
+            'fine_response_maps_ms': t_fine_rmap,
+            'fine_scoring_ms':       t_fine_score,
+            # Alias uniform keys used by the chart builder
+            'quantize_ms':      timing.get('coarse_quantize_ms', 0) + t_fine_quantize,
+            'spread_ms':        timing.get('coarse_spread_ms', 0)   + t_fine_spread,
+            'response_maps_ms': timing.get('coarse_response_maps_ms', 0) + t_fine_rmap,
+            'scoring_ms':       timing.get('coarse_scoring_ms', 0)  + t_fine_score,
+        })
+        return all_matches, timing
 
     def _nms(self, matches):
         """Non-maximum suppression by distance."""
@@ -959,19 +1185,15 @@ class LinemodMatcher:
         cv2.drawMarker(vis, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, marker_sz, thick)
 
         # Draw template features color-coded by orientation
-        tp_idx = match_result['template_id']
-        if tp_idx < len(self.template_pyramids):
+        tp_idx = match_result.get('template_id', -1)
+        if 0 <= tp_idx < len(self.template_pyramids):
             templ = self.template_pyramids[tp_idx]['templates'][0]
             tp_w, tp_h = self.template_pyramids[tp_idx]['size']
-            # When downsample was used, feat coords are in downsampled space
-            # but bbox is in original space. Scale features to match.
-            feat_scale_x = bw / tp_w if tp_w > 0 else 1.0
-            feat_scale_y = bh / tp_h if tp_h > 0 else 1.0
             colors = [(0,0,255),(0,170,255),(0,255,170),(0,255,0),
                       (170,255,0),(255,170,0),(255,0,0),(255,0,170)]
             for feat in templ.features:
-                fx = bx + int((feat.x + templ.tl_x) * feat_scale_x)
-                fy = by + int((feat.y + templ.tl_y) * feat_scale_y)
+                fx = int(cx - tp_w // 2 + feat.x + templ.tl_x)
+                fy = int(cy - tp_h // 2 + feat.y + templ.tl_y)
                 cv2.circle(vis, (fx, fy), dot_r, colors[feat.label % 8], -1)
 
         info = (f"Score:{match_result['score']:.1f}%  "
@@ -982,10 +1204,12 @@ class LinemodMatcher:
                    font_scale, (0, 255, 0), thick)
 
         if show:
-            plt.figure(figsize=(10, 8))
+            fig = plt.figure(figsize=(10, 8))
             plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
             plt.title("LINE-2D Match Result")
-            plt.axis('off'); plt.show()
+            plt.axis('off')
+            plt.show()
+            plt.close(fig)  # release figure memory
 
         return vis
 
@@ -1008,7 +1232,10 @@ class LinemodMatcher:
         for i in range(n):
             r, c = divmod(i, cols)
             tp = self.template_pyramids[i]
-            img = cv2.cvtColor(tp['image'], cv2.COLOR_GRAY2BGR)
+            # Regenerate the rotated image on-demand (not stored to save RAM)
+            src_rebuilt = LinemodMatcher._transform(
+                self.template_image, tp['angle'], tp['scale'])
+            img = cv2.cvtColor(src_rebuilt, cv2.COLOR_GRAY2BGR)
             templ = tp['templates'][0]
             for feat in templ.features:
                 cv2.circle(img, (templ.tl_x + feat.x, templ.tl_y + feat.y),

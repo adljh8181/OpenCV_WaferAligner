@@ -1,0 +1,15 @@
+import cv2, time, numpy as np
+gray = np.random.randint(0, 255, (5000, 5000), dtype=np.uint8).astype(np.float32)
+
+t0 = time.time()
+g_g = cv2.cuda_GpuMat()
+g_g.upload(gray)
+sx = cv2.cuda.createSobelFilter(cv2.CV_32F, cv2.CV_32F, 1, 0, ksize=3)
+sy = cv2.cuda.createSobelFilter(cv2.CV_32F, cv2.CV_32F, 0, 1, ksize=3)
+g_dx = sx.apply(g_g)
+g_dy = sy.apply(g_g)
+g_m = cv2.cuda.magnitude(g_dx, g_dy, cv2.cuda_GpuMat())
+g_a = cv2.cuda.phase(g_dx, g_dy, cv2.cuda_GpuMat(), angleInDegrees=True)
+m_c = g_m.download()
+a_c = g_a.download()
+print(f'GPU NO DX DY: {time.time()-t0:.3f}s')

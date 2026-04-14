@@ -305,16 +305,23 @@ class PatternTab:
         self.btn_detect_pattern.config(state='disabled', text="Detecting…")
         self._log("[Pattern] Matching started…")
 
-        tk_vars_snapshot = self._get_tk_vars()
+        # Extract StringVar values on the main thread so the background thread
+        # never touches the Tcl interpreter (avoids RuntimeError / Variable.__del__).
+        class _StrConst:
+            __slots__ = ('_v',)
+            def __init__(self, v): self._v = v
+            def get(self): return self._v
+
+        tk_vars_snapshot = {k: _StrConst(v.get()) for k, v in self._get_tk_vars().items()}
 
         def _run():
-            resp, orig_color = self.vm.run_find_pattern(tk_vars_snapshot)
+            resp, orig_color, timing = self.vm.run_find_pattern(tk_vars_snapshot)
             # Schedule UI update back on the main thread
-            self.tab.after(0, lambda: self._on_find_pattern_done(resp, orig_color))
+            self.tab.after(0, lambda: self._on_find_pattern_done(resp, orig_color, timing))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_find_pattern_done(self, resp, orig_color):
+    def _on_find_pattern_done(self, resp, orig_color, timing):
         """Called on the main thread after matching completes."""
         self.btn_detect_pattern.config(state='normal', text="Detect!")
 
@@ -337,6 +344,28 @@ class PatternTab:
             self._log("[Pattern] No match found.")
             if orig_color is not None:
                 self._display_cv2_image(orig_color, self.lbl_pattern_output)
+
+        # ---- Timing report --------------------------------------------------
+        if timing:
+            mode  = timing.get('mode', 'Single-Level')
+            total = timing.get('grand_total_ms', 0)
+            self._log(
+                f"[Timing] {mode} | Total={total:.1f}ms | "
+                f"Load={timing.get('image_load_ms',0):.1f}ms "
+                f"Quan={timing.get('quantize_ms',0):.1f}ms "
+                f"Spread={timing.get('spread_ms',0):.1f}ms "
+                f"RMap={timing.get('response_maps_ms',0):.1f}ms "
+                f"Score={timing.get('scoring_ms',0):.1f}ms "
+                f"NMS={timing.get('nms_ms',0):.1f}ms"
+            )
+            # Show interactive chart in a new window
+            self.vm.show_timing_chart(timing)
+
+        # Force collection of any old PhotoImages (replaced label.image refs) on
+        # the main thread before the next background detection thread can trigger
+        # the cyclic GC and call PhotoImage.__del__ from the wrong thread.
+        import gc
+        gc.collect()
 
     def _on_show_orientations(self):
         if not self.state.template_loaded:

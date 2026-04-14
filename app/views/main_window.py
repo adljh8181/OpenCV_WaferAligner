@@ -499,11 +499,46 @@ class WaferAlignerUI:
 # Helper: embed a matplotlib figure in a non-blocking Tk Toplevel
 # ---------------------------------------------------------------------------
 def _show_figure_in_window(fig, title="Figure"):
-    """Embed a matplotlib figure in a non-blocking Tk Toplevel window."""
+    """Embed a matplotlib figure in a non-blocking Tk Toplevel window.
+
+    The figure is removed from matplotlib's global figure manager as soon as
+    it is embedded in the Tk canvas so it does not accumulate in RAM every
+    time a timing chart, orientation, or pipeline window is opened.
+    Closing the window also calls plt.close(fig) as a belt-and-braces guard.
+    """
     win = tk.Toplevel()
     win.title(title)
     win.resizable(True, True)
     canvas = FigureCanvasTkAgg(fig, master=win)
     canvas.draw()
     canvas.get_tk_widget().pack(fill='both', expand=True)
-    win.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig), win.destroy()))
+    # Release from matplotlib's figure manager immediately after embedding.
+    # The Tk canvas holds its own reference so the figure stays visible.
+    plt.close(fig)
+    # Keep a strong reference on the window so the FigureCanvasTkAgg
+    # (which holds a PhotoImage internally) is never GC'd from a background
+    # thread — its lifetime is tied to the Toplevel window instead.
+    win._canvas = canvas
+
+    def _on_close():
+        import gc
+        c = win._canvas
+        win._canvas = None
+        if c is not None:
+            # Break the Figure↔FigureCanvasTkAgg reference cycle explicitly on
+            # the main thread.  Without this, `canvas.figure → fig → fig.canvas
+            # → canvas` forms a cycle that Python's cyclic GC may collect from
+            # a background thread, causing PhotoImage.__del__ to fire there.
+            try:
+                f = getattr(c, 'figure', None)
+                if f is not None:
+                    f.canvas = None   # break fig → canvas
+                    c.figure = None   # break canvas → fig
+            except Exception:
+                pass
+        win.destroy()
+        # Immediately collect any residual cycles here on the main thread so
+        # no background thread can trigger the collection instead.
+        gc.collect()
+
+    win.protocol("WM_DELETE_WINDOW", _on_close)

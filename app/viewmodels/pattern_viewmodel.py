@@ -20,7 +20,8 @@ import numpy as np
 from app.services.linemod_matcher import (
     LinemodMatcher, LinemodConfig,
     _quantize_gradients, _spread, _compute_response_maps,
-    _extract_scattered_features
+    _extract_scattered_features,
+    _CUDA_AVAILABLE
 )
 from app.models.app_state import AppState
 
@@ -43,6 +44,14 @@ class PatternViewModel:
         
         # Smart verification to prevent duplicate template generation
         self._last_template_config_str = None
+
+        # Report GPU status at startup
+        cfg = self.linemod_matcher.config
+        if cfg.USE_GPU:
+            self._log("[Pattern] \u2705 GPU acceleration ENABLED (CUDA)")
+        else:
+            self._log("[Pattern] \u26a0\ufe0f GPU not available \u2014 using optimised CPU path "
+                      "(fast_mode + reduced coarse features)")
 
     def _get_current_config_str(self):
         """Returns a string representation of the current config settings"""
@@ -74,16 +83,17 @@ class PatternViewModel:
             t_spread = int(tk_vars['pattern_tspread_var'].get())
             cfg.T_PYRAMID        = [t_spread, t_spread * 2, t_spread * 4]
             cfg.HYSTERESIS_KERNEL = int(tk_vars['pattern_hyst_var'].get())
-            cfg.PYRAMID_LEVELS   = 3
 
             if mode == 'Simple (Fast)':
-                cfg.ANGLE_STEP  = 360
+                cfg.ANGLE_STEP  = 360 # Will map to just [0] degrees
                 cfg.SCALE_MIN   = cfg.SCALE_MAX = 1.0
             elif mode == 'With Rotation':
-                cfg.ANGLE_STEP  = 5
+                rot_deg = float(tk_vars['pattern_rot_var'].get())
+                cfg.ANGLE_STEP  = 10 if rot_deg > 0 else 360
                 cfg.SCALE_MIN   = cfg.SCALE_MAX = 1.0
             else:  # Full Search
-                cfg.ANGLE_STEP  = 5
+                rot_deg = float(tk_vars['pattern_rot_var'].get())
+                cfg.ANGLE_STEP  = 10 if rot_deg > 0 else 360
                 cfg.SCALE_MIN   = 0.8
                 cfg.SCALE_MAX   = 1.2
         except Exception as e:
@@ -415,20 +425,25 @@ class PatternViewModel:
         Match the template against the search image.
 
         Returns:
-            (resp, orig_color) where resp is the matcher result dict
-            (or None if no match) and orig_color is the BGR search image.
+            (resp, orig_color, timing) where resp is the matcher result dict
+            (or None if no match), orig_color is the BGR search image, and
+            timing is a dict of per-phase millisecond breakdowns.
         """
+        import time as _t
+        timing = {}
+
         path = tk_vars['pattern_img_var'].get()
         if not path or not os.path.exists(path):
-            return None, None
+            return None, None, {}
 
         if not self.state.template_loaded:
-            return None, None
+            return None, None, {}
 
         # Apply latest slider values to config
         self.apply_ui_configs(tk_vars)
 
         # Smart Verification: Only generate templates if config has changed
+        t0 = _t.perf_counter()
         current_config_str = self._get_current_config_str()
         if self._last_template_config_str != current_config_str:
             self._log("[Pattern] Settings changed. Re-building templates...")
@@ -436,12 +451,24 @@ class PatternViewModel:
             self._last_template_config_str = current_config_str
         else:
             self._log("[Pattern] Using existing cached templates (settings unchanged).")
+        timing['template_build_ms'] = (_t.perf_counter() - t0) * 1000
 
-        img       = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        orig_color = cv2.imread(path)
+        t0 = _t.perf_counter()
+        
+        # Cache image to avoid repeated 180ms disk reads during slider tuning
+        if not hasattr(self, '_last_img_path') or self._last_img_path != path:
+            self._cached_gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            self._cached_color = cv2.imread(path)
+            self._last_img_path = path
+
+        img = self._cached_gray.copy() if self._cached_gray is not None else None
+        orig_color = self._cached_color.copy() if self._cached_color is not None else None
+        
+        timing['image_load_ms'] = (_t.perf_counter() - t0) * 1000
         if img is None:
-            return None, None
+            return None, None, {}
 
+        t0 = _t.perf_counter()
         try:
             rot = int(tk_vars['pattern_rot_var'].get())
             if rot != 0:
@@ -456,9 +483,25 @@ class PatternViewModel:
                 orig_color = cv2.warpAffine(orig_color, M, (nw, nh))
         except Exception:
             pass
+        timing['rotation_ms'] = (_t.perf_counter() - t0) * 1000
 
+        t0 = _t.perf_counter()
         resp = self.linemod_matcher.match(img)
-        return resp, orig_color
+        timing['match_total_ms'] = (_t.perf_counter() - t0) * 1000
+
+        # Merge internal per-phase timings from the matcher
+        inner = getattr(self.linemod_matcher, '_last_timing', {})
+        timing.update(inner)
+
+        # Grand total
+        timing['grand_total_ms'] = (
+            timing.get('image_load_ms', 0)
+            + timing.get('template_build_ms', 0)
+            + timing.get('rotation_ms', 0)
+            + timing.get('match_total_ms', 0)
+        )
+
+        return resp, orig_color, timing
 
     def compute_delta(self, resp: dict) -> tuple[float, float]:
         """
@@ -474,6 +517,129 @@ class PatternViewModel:
         if cx is not None:
             return match_cx - cx, match_cy - cy
         return match_cx, match_cy
+
+    # ------------------------------------------------------------------
+    # Timing chart
+    # ------------------------------------------------------------------
+
+    def show_timing_chart(self, timing: dict):
+        """
+        Pop up a Matplotlib bar chart showing per-phase timings.
+        Called on the main thread after detection completes.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from app.views.main_window import _show_figure_in_window
+
+        mode = timing.get('mode', 'Single-Level')
+        is_pyramid = 'Pyramid' in mode
+
+        # ---- Build ordered phases ----------------------------------------
+        if is_pyramid:
+            phases = [
+                ('Image Load',            timing.get('image_load_ms', 0),     '#4e9af1'),
+                ('Template Build',         timing.get('template_build_ms', 0),'#f19a4e'),
+                ('Rotation',              timing.get('rotation_ms', 0),       '#a0a0a0'),
+                ('Downsample',            timing.get('downsample_ms', 0),     '#8ecae6'),
+                ('Coarse Quantize',       timing.get('coarse_quantize_ms', 0),'#219ebc'),
+                ('Coarse Spread',         timing.get('coarse_spread_ms', 0),  '#023047'),
+                ('Coarse Resp. Maps',     timing.get('coarse_response_maps_ms', 0), '#ffb703'),
+                ('Coarse Scoring',        timing.get('coarse_scoring_ms', 0), '#fb8500'),
+                ('Fine Quantize',         timing.get('fine_quantize_ms', 0),  '#6a994e'),
+                ('Fine Spread',           timing.get('fine_spread_ms', 0),    '#386641'),
+                ('Fine Resp. Maps',       timing.get('fine_response_maps_ms', 0), '#a7c957'),
+                ('Fine Scoring',          timing.get('fine_scoring_ms', 0),   '#2d6a4f'),
+                ('NMS + Sort',            timing.get('nms_ms', 0),            '#9d4edd'),
+            ]
+        else:
+            phases = [
+                ('Image Load',    timing.get('image_load_ms', 0),     '#4e9af1'),
+                ('Template Build',timing.get('template_build_ms', 0), '#f19a4e'),
+                ('Rotation',      timing.get('rotation_ms', 0),       '#a0a0a0'),
+                ('Quantize',      timing.get('quantize_ms', 0),       '#219ebc'),
+                ('Spread',        timing.get('spread_ms', 0),         '#023047'),
+                ('Response Maps', timing.get('response_maps_ms', 0),  '#ffb703'),
+                ('Scoring',       timing.get('scoring_ms', 0),        '#fb8500'),
+                ('NMS + Sort',    timing.get('nms_ms', 0),            '#9d4edd'),
+            ]
+
+        # Filter out zero-time phases (e.g. no rotation)
+        phases = [(label, val, color) for label, val, color in phases if val > 0.0]
+
+        labels = [p[0] for p in phases]
+        values = [p[1] for p in phases]
+        colors = [p[2] for p in phases]
+        total  = timing.get('grand_total_ms', sum(values))
+
+        # ---- Figure ----------------------------------------------------------
+        fig, (ax_bar, ax_pie) = plt.subplots(
+            1, 2, figsize=(14, 6),
+            gridspec_kw={'width_ratios': [2, 1]})
+        fig.patch.set_facecolor('#1a1a2e')
+        for ax in (ax_bar, ax_pie):
+            ax.set_facecolor('#16213e')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#555')
+
+        title_str = (
+            f'LINE-2D Matching Pipeline Timing  \u2014  {mode}\n'
+            f'Total: {total:.1f} ms'
+        )
+        fig.suptitle(title_str, fontsize=13, fontweight='bold',
+                     color='#e0e0e0', y=1.01)
+
+        # ---- Horizontal bar chart --------------------------------------------
+        y_pos = range(len(labels))
+        bars = ax_bar.barh(list(y_pos), values, color=colors,
+                           edgecolor='#333', height=0.6)
+        ax_bar.set_yticks(list(y_pos))
+        ax_bar.set_yticklabels(labels, fontsize=10, color='#d0d0d0')
+        ax_bar.set_xlabel('Time (ms)', fontsize=10, color='#d0d0d0')
+        ax_bar.tick_params(colors='#aaa', labelsize=9)
+        ax_bar.set_title('Per-Phase Timing (ms)', color='#e0e0e0', fontsize=11)
+        ax_bar.invert_yaxis()
+
+        # Value labels on bars
+        for bar, val in zip(bars, values):
+            pct = (val / total * 100) if total > 0 else 0
+            ax_bar.text(
+                bar.get_width() + max(values) * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.1f} ms ({pct:.1f}%)',
+                va='center', ha='left', fontsize=8.5, color='#cccccc')
+
+        # Grid
+        ax_bar.xaxis.grid(True, color='#333', linestyle='--', alpha=0.7)
+        ax_bar.set_axisbelow(True)
+
+        # ---- Pie chart -------------------------------------------------------
+        wedges, _, autotexts = ax_pie.pie(
+            values,
+            labels=None,
+            colors=colors,
+            autopct=lambda p: f'{p:.1f}%' if p > 2 else '',
+            startangle=140,
+            wedgeprops=dict(edgecolor='#1a1a2e', linewidth=1.5),
+        )
+        for at in autotexts:
+            at.set_fontsize(8)
+            at.set_color('#ffffff')
+
+        # Legend outside pie
+        ax_pie.legend(
+            wedges, [f'{l} ({v:.1f} ms)' for l, v in zip(labels, values)],
+            loc='lower center',
+            bbox_to_anchor=(0.5, -0.35),
+            ncol=2,
+            fontsize=7.5,
+            facecolor='#1a1a2e',
+            labelcolor='#cccccc',
+            edgecolor='#555',
+        )
+        ax_pie.set_title('Proportion', color='#e0e0e0', fontsize=11)
+
+        plt.tight_layout()
+        _show_figure_in_window(fig, f'Pipeline Timing \u2014 {total:.1f} ms total')
 
     # ------------------------------------------------------------------
     # Diagnostic visualizations  (open separate Toplevel windows)
@@ -503,9 +669,11 @@ class PatternViewModel:
         if template_img is None or search_img is None:
             self._log("Load both template and search images first.")
             return
+            
+        cfg = self.linemod_matcher.config
 
-        q_t, _ = _quantize_gradients(template_img, -weak, kernel_size=hk)
-        q_s, _ = _quantize_gradients(search_img,   -weak, kernel_size=hk)
+        q_t, _ = _quantize_gradients(template_img, cfg.WEAK_THRESHOLD, kernel_size=hk)
+        q_s, _ = _quantize_gradients(search_img,   cfg.WEAK_THRESHOLD, kernel_size=hk)
         s_s    = _spread(q_s, T)
 
         colors = np.array([
@@ -576,8 +744,10 @@ class PatternViewModel:
         magnitude = np.sqrt(dx * dx + dy * dy)
         angle     = np.degrees(np.arctan2(dy, dx)) % 360.0
 
-        quantized, mag = _quantize_gradients(gray,     -weak, kernel_size=hk)
-        q_tmpl,   mag_tmpl = _quantize_gradients(tmpl_gray, -weak, kernel_size=hk)
+        cfg = self.linemod_matcher.config
+
+        quantized, mag = _quantize_gradients(gray,     cfg.WEAK_THRESHOLD, kernel_size=hk)
+        q_tmpl,   mag_tmpl = _quantize_gradients(tmpl_gray, cfg.WEAK_THRESHOLD, kernel_size=hk)
         spread    = _spread(quantized, T)
         rmaps     = _compute_response_maps(spread)
         response_combined = np.max(np.stack(rmaps, axis=0), axis=0)
