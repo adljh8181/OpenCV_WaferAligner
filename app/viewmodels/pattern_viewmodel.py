@@ -639,7 +639,7 @@ class PatternViewModel:
         ax_pie.set_title('Proportion', color='#e0e0e0', fontsize=11)
 
         plt.tight_layout()
-        _show_figure_in_window(fig, f'Pipeline Timing \u2014 {total:.1f} ms total')
+        return _show_figure_in_window(fig, f'Pipeline Timing \u2014 {total:.1f} ms total')
 
     # ------------------------------------------------------------------
     # Diagnostic visualizations  (open separate Toplevel windows)

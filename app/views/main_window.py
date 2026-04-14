@@ -524,21 +524,22 @@ def _show_figure_in_window(fig, title="Figure"):
         import gc
         c = win._canvas
         win._canvas = None
+        # Destroy the window FIRST so matplotlib's filter_destroy callback can
+        # still access canvas.figure during the Tk <Destroy> event.  Breaking
+        # the cycle before destroy causes the AttributeError:
+        #   'NoneType' object has no attribute '_canvas_callbacks'
+        win.destroy()
+        # THEN break the Figure↔FigureCanvasTkAgg reference cycle so Python's
+        # cyclic GC does not collect it from a background thread.
         if c is not None:
-            # Break the Figure↔FigureCanvasTkAgg reference cycle explicitly on
-            # the main thread.  Without this, `canvas.figure → fig → fig.canvas
-            # → canvas` forms a cycle that Python's cyclic GC may collect from
-            # a background thread, causing PhotoImage.__del__ to fire there.
             try:
                 f = getattr(c, 'figure', None)
                 if f is not None:
-                    f.canvas = None   # break fig → canvas
-                    c.figure = None   # break canvas → fig
+                    f.canvas = None
+                    c.figure = None
             except Exception:
                 pass
-        win.destroy()
-        # Immediately collect any residual cycles here on the main thread so
-        # no background thread can trigger the collection instead.
         gc.collect()
 
     win.protocol("WM_DELETE_WINDOW", _on_close)
+    return win

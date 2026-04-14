@@ -45,7 +45,7 @@
     <GradThrPct>90.0</GradThrPct>
     <TSpread>1</TSpread>
     <HystKernel>0</HystKernel>
-    <SearchMode>With Rotation</SearchMode>
+    <SearchMode>Simple (Fast)</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
     <TemplateCropCX>2295.0</TemplateCropCX>
     <TemplateCropCY>3485.0</TemplateCropCY>

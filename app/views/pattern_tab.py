@@ -357,8 +357,15 @@ class PatternTab:
                 f"Score={timing.get('scoring_ms',0):.1f}ms "
                 f"NMS={timing.get('nms_ms',0):.1f}ms"
             )
-            # Show interactive chart in a new window
-            self.vm.show_timing_chart(timing)
+            # Close the previous timing chart window before opening a new one
+            # so figures and PhotoImages don't accumulate in memory.
+            prev_win = getattr(self, '_timing_win', None)
+            if prev_win is not None:
+                try:
+                    prev_win.destroy()
+                except Exception:
+                    pass
+            self._timing_win = self.vm.show_timing_chart(timing)
 
         # Force collection of any old PhotoImages (replaced label.image refs) on
         # the main thread before the next background detection thread can trigger
