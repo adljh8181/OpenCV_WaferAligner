@@ -21,7 +21,6 @@ from app.services.linemod_matcher import (
     LinemodMatcher, LinemodConfig,
     _quantize_gradients, _spread, _compute_response_maps,
     _extract_scattered_features,
-    _CUDA_AVAILABLE
 )
 from app.models.app_state import AppState
 
@@ -44,14 +43,7 @@ class PatternViewModel:
         
         # Smart verification to prevent duplicate template generation
         self._last_template_config_str = None
-
-        # Report GPU status at startup
-        cfg = self.linemod_matcher.config
-        if cfg.USE_GPU:
-            self._log("[Pattern] \u2705 GPU acceleration ENABLED (CUDA)")
-        else:
-            self._log("[Pattern] \u26a0\ufe0f GPU not available \u2014 using optimised CPU path "
-                      "(fast_mode + reduced coarse features)")
+        self._log("[Pattern] Using optimised CPU path.")
 
     def _get_current_config_str(self):
         """Returns a string representation of the current config settings"""
@@ -461,8 +453,11 @@ class PatternViewModel:
             self._cached_color = cv2.imread(path)
             self._last_img_path = path
 
-        img = self._cached_gray.copy() if self._cached_gray is not None else None
-        orig_color = self._cached_color.copy() if self._cached_color is not None else None
+        # Do NOT copy here — match() makes its own internal copy of the search
+        # image, and visualize_match() does the same for color.  Copying a
+        # 5120×5120 image allocates ~100 MB of RAM on every Detect! call.
+        img = self._cached_gray
+        orig_color = self._cached_color
         
         timing['image_load_ms'] = (_t.perf_counter() - t0) * 1000
         if img is None:

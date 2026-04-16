@@ -13,6 +13,17 @@ import pystray
 from app.views.main_window import WaferAlignerUI
 
 
+def _cleanup_temp_files():
+    """Delete temp_cropped_template_* files left behind from previous sessions."""
+    cwd = os.getcwd()
+    for f in os.listdir(cwd):
+        if f.startswith("temp_cropped_template_"):
+            try:
+                os.remove(os.path.join(cwd, f))
+            except Exception:
+                pass
+
+
 def main():
     root = tk.Tk()
 
@@ -24,6 +35,9 @@ def main():
 
     app = WaferAlignerUI(root)
 
+    # Clean up any temp files left from previous sessions on startup
+    _cleanup_temp_files()
+
     # Manage system tray state
     icon_instance = None
 
@@ -33,6 +47,7 @@ def main():
 
     def on_exit(icon, item):
         icon.stop()
+        _cleanup_temp_files()
         root.after(0, lambda: (app.on_stop_server(), root.destroy()))
 
     def on_closing():

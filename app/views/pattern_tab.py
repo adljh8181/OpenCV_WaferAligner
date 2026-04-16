@@ -359,12 +359,23 @@ class PatternTab:
             )
             # Close the previous timing chart window before opening a new one
             # so figures and PhotoImages don't accumulate in memory.
+            # IMPORTANT: call _cleanup_func (not just .destroy()) so the
+            # FigureCanvasTkAgg ↔ Figure reference cycle is broken and the
+            # matplotlib figure's memory is released.  Plain .destroy() only
+            # tears down the Tk widget; it does NOT invoke the
+            # WM_DELETE_WINDOW protocol callback.
             prev_win = getattr(self, '_timing_win', None)
+            self._timing_win = None
             if prev_win is not None:
                 try:
-                    prev_win.destroy()
+                    cleanup = getattr(prev_win, '_cleanup_func', None)
+                    if cleanup is not None:
+                        cleanup()
+                    else:
+                        prev_win.destroy()
                 except Exception:
                     pass
+            prev_win = None  # drop reference BEFORE gc.collect() below
             self._timing_win = self.vm.show_timing_chart(timing)
 
         # Force collection of any old PhotoImages (replaced label.image refs) on

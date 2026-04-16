@@ -148,9 +148,13 @@ class WaferAlignerUI:
                 return
 
             scale    = min(target_w / w, target_h / h)
-            img_disp = img.copy()
+            # Only copy if an overlay will modify the image; otherwise resize
+            # directly from the source to avoid a ~75 MB temporary for 5120px images.
             if overlay_func:
+                img_disp = img.copy()
                 img_disp = overlay_func(img_disp)
+            else:
+                img_disp = img
 
             new_w    = max(int(w * scale), 1)
             new_h    = max(int(h * scale), 1)
@@ -542,4 +546,7 @@ def _show_figure_in_window(fig, title="Figure"):
         gc.collect()
 
     win.protocol("WM_DELETE_WINDOW", _on_close)
+    # Expose the cleanup function so callers can trigger it on programmatic
+    # close (win.destroy() does NOT fire WM_DELETE_WINDOW).
+    win._cleanup_func = _on_close
     return win

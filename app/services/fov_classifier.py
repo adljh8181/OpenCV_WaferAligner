@@ -17,6 +17,11 @@ import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 import os
+import sys
+
+# Resolve the project root whether running as a .py script or a PyInstaller exe
+_BASE_DIR = getattr(sys, '_MEIPASS', None) or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ==============================================================================
@@ -27,7 +32,7 @@ class ClassificationConfig:
     """Configuration for FOV classification parameters"""
 
     # --- FILE SETTINGS ---
-    IMAGE_FOLDER = os.path.join(os.path.dirname(__file__), 'Images', 'LEFT_EDGE_PNG')
+    IMAGE_FOLDER = os.path.join(_BASE_DIR, 'Images', 'LEFT_EDGE_PNG')
     DEFAULT_IMAGE = 'Copy of sample_wafer.jpg'
 
     # --- IMAGE PROCESSING ---

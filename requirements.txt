@@ -1,0 +1,17 @@
+# ============================================================
+# WaferAligner UI — Direct Dependencies
+# ============================================================
+# Install with:  pip install -r requirements.txt
+#
+# Note: OpenCV is a custom CUDA-enabled build.
+# If you don't need CUDA, replace with:
+#   pip install opencv-contrib-python
+# ============================================================
+
+numpy>=1.26
+pillow>=10.0
+matplotlib>=3.8
+pyzmq>=25.0
+pystray>=0.19
+# opencv: install the custom CUDA build separately (see README), or:
+# pip install opencv-contrib-python

@@ -31,21 +31,10 @@ Author: Wafer Alignment System (ported from SBM_line2D C++)
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 
-# ======================================================================
-# GPU / CUDA detection  (one-shot at import time)
-# ======================================================================
-try:
-    _CUDA_DEVICE_COUNT = cv2.cuda.getCudaEnabledDeviceCount()
-except Exception:
-    _CUDA_DEVICE_COUNT = 0
-_CUDA_AVAILABLE = _CUDA_DEVICE_COUNT > 0
-
-if _CUDA_AVAILABLE:
-    print(f"[LINE-2D] CUDA enabled — {_CUDA_DEVICE_COUNT} device(s) detected.")
-else:
-    print("[LINE-2D] CUDA not available — using optimised CPU path.")
+print("[LINE-2D] Using optimised CPU path.")
 
 
 # ======================================================================
@@ -82,8 +71,7 @@ class LinemodConfig:
         self.MATCH_THRESHOLD = 50.0   # Similarity 0–100
         self.NMS_DISTANCE = 30
 
-        # --- Performance / GPU ---
-        self.USE_GPU = _CUDA_AVAILABLE          # Auto-detect, set False to force CPU
+        # --- Performance ---
         self.FAST_SEARCH_QUANTIZE = True        # Skip hysteresis on search images
         self.COARSE_NUM_FEATURES  = 128          # Fewer features for coarse scanning
         self.MAX_COARSE_CANDIDATES = 2           # Number of top candidates to keep per template at coarse level
@@ -116,8 +104,7 @@ class TemplatePyr:
 # Core Algorithm  (mirrors SBM line2Dup.cpp)
 # ======================================================================
 
-def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0,
-                        use_gpu=False):
+def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0):
     """
     Compute gradient and quantize angle into 8 orientation bins.
     Each pixel gets a label 0-7 encoded as a power of 2 (1,2,...,128) or 0.
@@ -130,7 +117,6 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
                      0 = auto-compute from image resolution. Explicit values
                      ensure the template crop and search image use the same
                      kernel even when they differ in spatial size.
-        use_gpu: If True AND CUDA is available, offload Blur/Sobel to GPU.
 
     Mirrors: hysteresisGradient() in line2Dup.cpp
     """
@@ -142,65 +128,19 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     h, w = gray.shape
     max_dim = max(h, w)
 
-    # ---- GPU path for Blur + Sobel + magnitude --------------------------
-    _did_gpu = False
-    if use_gpu and _CUDA_AVAILABLE:
-        try:
-            gpu_gray = cv2.cuda_GpuMat()
-            gpu_gray.upload(gray)
+    if not fast_mode:
+        if kernel_size > 0:
+            ks_blur = max(3, kernel_size | 1)  # enforce odd, min 3
+            gray = cv2.GaussianBlur(gray, (ks_blur, ks_blur), 0)
+        elif max_dim > 1500:
+            sigma = max(1.0, (max_dim - 1000) / 1500.0)
+            ksize = int(sigma * 2) * 2 + 1
+            gray = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
 
-            # Gaussian blur
-            if not fast_mode:
-                if kernel_size > 0 and kernel_size >= 3:
-                    ks_blur = max(3, kernel_size | 1)  # enforce odd
-                    blur_filter = cv2.cuda.createGaussianFilter(
-                        cv2.CV_32F, cv2.CV_32F,
-                        (ks_blur, ks_blur), 0)
-                    gpu_gray = blur_filter.apply(gpu_gray)
-                elif max_dim > 1500:
-                    sigma = max(1.0, (max_dim - 1000) / 1500.0)
-                    ksize = int(sigma * 2) * 2 + 1
-                    blur_filter = cv2.cuda.createGaussianFilter(
-                        cv2.CV_32F, cv2.CV_32F,
-                        (ksize, ksize), sigma)
-                    gpu_gray = blur_filter.apply(gpu_gray)
-
-            # Sobel dx, dy
-            sobel_x = cv2.cuda.createSobelFilter(
-                cv2.CV_32F, cv2.CV_32F, 1, 0, ksize=3)
-            sobel_y = cv2.cuda.createSobelFilter(
-                cv2.CV_32F, cv2.CV_32F, 0, 1, ksize=3)
-            gpu_dx = sobel_x.apply(gpu_gray)
-            gpu_dy = sobel_y.apply(gpu_gray)
-
-            # Magnitude and Phase on GPU
-            gpu_mag = cv2.cuda.magnitude(gpu_dx, gpu_dy, cv2.cuda_GpuMat())
-            gpu_angle = cv2.cuda.phase(gpu_dx, gpu_dy, cv2.cuda_GpuMat(), angleInDegrees=True)
-
-            # Download results (skip dx, dy, gray as they are unused, saves large PCIe transfer latency)
-            magnitude = gpu_mag.download()
-            angle = gpu_angle.download() % 360.0
-            _did_gpu = True
-        except Exception as e:
-            print(f"[LINE-2D CUDA ERROR] Fallback to CPU: {e}")
-            # Silently fall back to CPU
-            _did_gpu = False
-
-    # ---- CPU path for Blur + Sobel + magnitude --------------------------
-    if not _did_gpu:
-        if not fast_mode:
-            if kernel_size > 0:
-                ks_blur = max(3, kernel_size | 1)  # enforce odd, min 3
-                gray = cv2.GaussianBlur(gray, (ks_blur, ks_blur), 0)
-            elif max_dim > 1500:
-                sigma = max(1.0, (max_dim - 1000) / 1500.0)
-                ksize = int(sigma * 2) * 2 + 1
-                gray = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
-
-        dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        magnitude = cv2.magnitude(dx, dy)
-        angle = cv2.phase(dx, dy, angleInDegrees=True) % 360.0
+    dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = cv2.magnitude(dx, dy)
+    angle = cv2.phase(dx, dy, angleInDegrees=True) % 360.0
 
     # Quantize to 16 buckets then fold to 8 (& 7)
     quant_16 = (angle * (16.0 / 360.0)).astype(np.uint8)
@@ -259,23 +199,18 @@ def _quantize_gradients(src, weak_threshold=30.0, fast_mode=False, kernel_size=0
     return quantized, magnitude
 
 
-def _spread(quantized, T, use_gpu=False):
+def _spread(quantized, T):
     """
     OR-spread quantized orientations over a (2T-1)×(2T-1) neighbourhood.
 
-    Equivalent to the original loop-based spread but implemented via
-    cv2.dilate on each of the 8 bit-planes. This is 3-8× faster natively on CPU
-    because cv2.dilate implements highly optimized vector SIMD instructions.
-    GPU acceleration is DISABLED here because PCIe transfer overhead of 8 bit-planes 
-    is natively slower than the vectorized CPU.
+    Implemented via cv2.dilate on each of the 8 bit-planes — 3-8× faster
+    than a naive loop thanks to OpenCV's SIMD-optimised dilation.
     """
     if T <= 1:
         return quantized.copy()
 
     ks = 2 * T - 1
     kernel = np.ones((ks, ks), dtype=np.uint8)
-
-    # ---- CPU path (Optimized natively in openCV over PCIe overheads) ----
     result = np.zeros_like(quantized)
     for bit in range(8):
         plane = ((quantized >> bit) & 1).astype(np.uint8)
@@ -522,7 +457,6 @@ class LinemodMatcher:
         template crops are small — PCIe upload/download overhead exceeds the
         GPU compute saving for images < ~500 px.  GPU is still used in match().
         """
-        import os as _os
         from concurrent.futures import ThreadPoolExecutor
 
         if self.template_image is None:
@@ -567,12 +501,9 @@ class LinemodMatcher:
                     pyr_mask = cv2.pyrDown(pyr_mask)
                     pyr_mask = (pyr_mask > 128).astype(np.uint8) * 255
 
-                # use_gpu=False: template crops are small; GPU PCIe overhead > CPU gain.
-                # GPU is still used during match() on the full search image.
                 quantized, mag = _quantize_gradients(
                     pyr_src, _cfg.WEAK_THRESHOLD,
-                    kernel_size=_cfg.HYSTERESIS_KERNEL,
-                    use_gpu=False)
+                    kernel_size=_cfg.HYSTERESIS_KERNEL)
                 features = _extract_scattered_features(
                     quantized, mag, _cfg.NUM_FEATURES, pyr_mask)
 
@@ -596,7 +527,7 @@ class LinemodMatcher:
 
         combos = [(angle, scale) for scale in scales for angle in angles]
         # Cap workers: no benefit beyond cpu_count; keep at least 1
-        max_workers = max(1, min(len(combos), (_os.cpu_count() or 4), 8))
+        max_workers = max(1, min(len(combos), (os.cpu_count() or 4), 8))
 
         results = []
         if max_workers > 1 and len(combos) > 1:
@@ -735,18 +666,20 @@ class LinemodMatcher:
         quantized, _ = _quantize_gradients(
             search_gray, cfg.WEAK_THRESHOLD,
             fast_mode=cfg.FAST_SEARCH_QUANTIZE,
-            kernel_size=cfg.HYSTERESIS_KERNEL,
-            use_gpu=cfg.USE_GPU)
+            kernel_size=cfg.HYSTERESIS_KERNEL)
         timing['quantize_ms'] = (_time.perf_counter() - t0) * 1000
 
         t0 = _time.perf_counter()
-        spread_q = _spread(quantized, T, use_gpu=cfg.USE_GPU)
+        spread_q = _spread(quantized, T)
         timing['spread_ms'] = (_time.perf_counter() - t0) * 1000
 
         t0 = _time.perf_counter()
         rmaps = _compute_response_maps(spread_q)
-        # Pre-cast response maps to int32 once to avoid massive memory allocations in the inner loop
+        # Pre-cast response maps to int32 once to avoid massive temporary
+        # allocations inside the inner loop (numpy would upcast on each +=
+        # otherwise).  Release spread_q and quantized now — no longer needed.
         rmaps_int32 = [r.astype(np.int32) for r in rmaps]
+        del rmaps, spread_q  # free uint8 maps; int32 copies are in rmaps_int32
         timing['response_maps_ms'] = (_time.perf_counter() - t0) * 1000
 
         t0 = _time.perf_counter()
@@ -780,15 +713,20 @@ class LinemodMatcher:
                     valid_feats += 1
 
             if valid_feats == 0:
+                del score_map
                 continue
 
             # Normalize: max score per feature = 4
+            # Use float32 (not float64) to halve the memory footprint of
+            # sim_map — accuracy to 0.001% is more than sufficient.
             max_possible = 4 * valid_feats
-            sim_map = (score_map * 100.0) / max_possible
+            sim_map = (score_map * np.float32(100.0)) / np.float32(max_possible)
+            del score_map  # no longer needed; release before further allocs
 
             # Find candidates with NMS
             ys, xs = np.where(sim_map > threshold)
             if len(xs) == 0:
+                del sim_map
                 continue
 
             scores = sim_map[ys, xs]
@@ -820,8 +758,10 @@ class LinemodMatcher:
                     if len(kept) >= 20:
                         break
 
+            del sim_map  # release before next template iteration
             all_matches.extend(kept)
 
+        del rmaps_int32  # release the 8 int32 response maps
         timing['scoring_ms'] = (_time.perf_counter() - t0) * 1000
         return all_matches, timing
 
@@ -866,17 +806,17 @@ class LinemodMatcher:
         t0 = time.perf_counter()
         q_c, _ = _quantize_gradients(search_coarse, cfg.WEAK_THRESHOLD,
                                     fast_mode=cfg.FAST_SEARCH_QUANTIZE,
-                                    kernel_size=cfg.HYSTERESIS_KERNEL,
-                                    use_gpu=False) # Force CPU for Coarse downsampled image (GPU PCIe is 4x slower here)
+                                    kernel_size=cfg.HYSTERESIS_KERNEL)
         timing['coarse_quantize_ms'] = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
-        s_c = _spread(q_c, T_c, use_gpu=cfg.USE_GPU)
+        s_c = _spread(q_c, T_c)
         timing['coarse_spread_ms'] = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
         rmaps_c = _compute_response_maps(s_c)
         rmaps_c_int32 = [r.astype(np.int32) for r in rmaps_c]
+        del rmaps_c, s_c, q_c  # free uint8 coarse arrays; int32 copies are kept
         timing['coarse_response_maps_ms'] = (time.perf_counter() - t0) * 1000
 
         # Lower threshold for coarse pass — be generous to not miss candidates.
@@ -922,11 +862,14 @@ class LinemodMatcher:
                     valid += 1
 
             if valid == 0:
+                del score_map
                 continue
 
-            sim_map = (score_map * 100.0) / (4 * valid)
+            sim_map = (score_map * np.float32(100.0)) / np.float32(4 * valid)
+            del score_map
             ys, xs = np.where(sim_map > coarse_threshold)
             if len(xs) == 0:
+                del sim_map
                 continue
 
             scores = sim_map[ys, xs]
@@ -955,6 +898,7 @@ class LinemodMatcher:
                     if len(kept_coarse) >= 1:   # best candidate only per template
                         break
 
+            del sim_map
             coarse_candidates.extend(kept_coarse)
 
             # Early exit only for single-template (Simple/Fast) mode.
@@ -967,6 +911,7 @@ class LinemodMatcher:
                     break
 
         timing['coarse_scoring_ms'] = (time.perf_counter() - t0) * 1000
+        del rmaps_c_int32  # coarse scoring done; free the 8 int32 coarse response maps
 
         # Limit fine-search work: keep only the top-N coarse candidates by
         # score so we don't run the full fine pass on hundreds of duplicates.
@@ -1047,17 +992,17 @@ class LinemodMatcher:
             _t = time.perf_counter()
             # kernel_size is missing in fine quantize because fast_mode=True means hysteresis is skipped, so kernel_size is irrelevant
             q_super, _ = _quantize_gradients(super_roi, cfg.WEAK_THRESHOLD,
-                                           fast_mode=True, # Always skip blur/hysteresis for fine search speed
-                                           use_gpu=False)
+                                           fast_mode=True)
             t_fine_quantize += (time.perf_counter() - _t) * 1000
 
             _t = time.perf_counter()
-            s_super = _spread(q_super, T0, use_gpu=False)
+            s_super = _spread(q_super, T0)
             t_fine_spread += (time.perf_counter() - _t) * 1000
 
             _t = time.perf_counter()
             rmaps_super = _compute_response_maps(s_super)
             rmaps_super_int32 = [r.astype(np.int32) for r in rmaps_super]
+            del rmaps_super, s_super, q_super  # free uint8 fine-ROI arrays
             t_fine_rmap += (time.perf_counter() - _t) * 1000
 
             for cand in cluster['candidates']:
@@ -1087,13 +1032,16 @@ class LinemodMatcher:
                         valid += 1
 
                 if valid == 0:
+                    del score_map
                     t_fine_score += (time.perf_counter() - _t) * 1000
                     continue
 
-                sim_map = (score_map * 100.0) / (4 * valid)
+                sim_map = (score_map * np.float32(100.0)) / np.float32(4 * valid)
+                del score_map
                 ys, xs = np.where(sim_map > threshold)
-                
+
                 if len(xs) == 0:
+                    del sim_map
                     t_fine_score += (time.perf_counter() - _t) * 1000
                     continue
 
@@ -1129,8 +1077,11 @@ class LinemodMatcher:
                         if len(kept) >= 5:
                             break
 
+                del sim_map  # free before next candidate
                 t_fine_score += (time.perf_counter() - _t) * 1000
                 all_matches.extend(kept)
+
+            del rmaps_super_int32  # free int32 fine-ROI maps after all candidates in cluster
 
         t_fine = (time.perf_counter() - t0_fine_total) * 1000
         print(f"  [Pyramid] Fine   (L0 {sw}×{sh}): {len(all_matches)} matches in {t_fine:.0f}ms")
