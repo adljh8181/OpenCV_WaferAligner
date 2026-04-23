@@ -25,8 +25,4 @@ echo.
 echo [Build] SUCCESS!
 echo Output: dist\WaferAlignerUI.exe
 echo.
-echo NOTE: CUDA is auto-detected at runtime.
-echo       - GPU machine  : CUDA will be used automatically
-echo       - No-GPU machine : falls back to CPU automatically
-echo.
 pause

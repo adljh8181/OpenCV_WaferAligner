@@ -121,7 +121,7 @@ class WaferAlignerUI:
 
     def _log_status(self, msg: str):
         """Write to the ZMQ tab Status log (thread-safe via root.after)."""
-        self.zmq_tab.log(self.zmq_tab.log_status, msg)
+        self.root.after(0, lambda m=msg: self.zmq_tab.log(self.zmq_tab.log_status, m))
 
     def display_cv2_image(self, img, label, overlay_func=None):
         """Resize and display a BGR/gray OpenCV image in a Tkinter Label."""

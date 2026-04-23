@@ -11,7 +11,9 @@ Responsibilities:
 ================================================================================
 """
 
+import gc
 import os
+import queue
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -300,6 +302,38 @@ class PatternTab:
             messagebox.showwarning("Warning", "Load or crop a template first!")
             return
 
+        # ── Pre-thread cleanup ────────────────────────────────────────────
+        # Destroy the old timing window and clear the result-image label NOW,
+        # on the main thread, so their FigureCanvasTkAgg / PhotoImage objects
+        # are GC-collected here — NOT later by a background-thread cyclic GC
+        # (which causes Variable.__del__ / Image.__del__ from wrong thread →
+        # Tcl_AsyncDelete crash).
+        prev_win = getattr(self, '_timing_win', None)
+        self._timing_win = None
+        if prev_win is not None:
+            try:
+                cleanup = getattr(prev_win, '_cleanup_func', None)
+                if cleanup is not None:
+                    cleanup()
+                else:
+                    prev_win.destroy()
+            except Exception:
+                pass
+        prev_win = None
+
+        # Drop old PhotoImage reference from the output label
+        try:
+            self.lbl_pattern_output.config(image='')
+            self.lbl_pattern_output.image = None
+        except Exception:
+            pass
+
+        # Collect any reference cycles (FigureCanvasTkAgg ↔ Figure,
+        # old PhotoImages, etc.) on the main thread before the background
+        # thread starts making heavy numpy allocations that would otherwise
+        # trigger cyclic GC in the wrong thread.
+        gc.collect()
+
         # Prevent double-click while already running
         self.btn_detect_pattern.config(state='disabled', text="Detecting…")
         self._log("[Pattern] Matching started…")
@@ -313,12 +347,36 @@ class PatternTab:
 
         tk_vars_snapshot = {k: _StrConst(v.get()) for k, v in self._get_tk_vars().items()}
 
+        # Use a queue so the background thread NEVER calls any tkinter method
+        # (including widget.after()) — all communication back to the main thread
+        # goes through this queue, polled by _poll_result().
+        result_queue = queue.Queue()
+
         def _run():
-            resp, orig_color, timing = self.vm.run_find_pattern(tk_vars_snapshot)
-            # Schedule UI update back on the main thread
-            self.tab.after(0, lambda: self._on_find_pattern_done(resp, orig_color, timing))
+            try:
+                resp, orig_color, timing = self.vm.run_find_pattern(tk_vars_snapshot)
+                result_queue.put(('ok', resp, orig_color, timing))
+            except Exception as exc:
+                result_queue.put(('error', str(exc), None, {}))
 
         threading.Thread(target=_run, daemon=True).start()
+        self._poll_result(result_queue)
+
+    def _poll_result(self, result_queue: 'queue.Queue'):
+        """Poll the result queue on the main thread; reschedule until ready."""
+        try:
+            item = result_queue.get_nowait()
+        except queue.Empty:
+            self.tab.after(50, lambda: self._poll_result(result_queue))
+            return
+        kind = item[0]
+        if kind == 'ok':
+            _, resp, orig_color, timing = item
+            self._on_find_pattern_done(resp, orig_color, timing)
+        else:
+            _, err, _, _ = item
+            self._log(f"[Pattern] Detection error: {err}")
+            self.btn_detect_pattern.config(state='normal', text="Detect!")
 
     def _on_find_pattern_done(self, resp, orig_color, timing):
         """Called on the main thread after matching completes."""
@@ -340,6 +398,8 @@ class PatternTab:
                                     overlay_func=draw_rect_overlay)
         else:
             self.pattern_score_var.set("0 (No Match)")
+            self.pattern_x_var.set("0")
+            self.pattern_y_var.set("0")
             self._log("[Pattern] No match found.")
             if orig_color is not None:
                 self._display_cv2_image(orig_color, self.lbl_pattern_output)
@@ -357,32 +417,9 @@ class PatternTab:
                 f"Score={timing.get('scoring_ms',0):.1f}ms "
                 f"NMS={timing.get('nms_ms',0):.1f}ms"
             )
-            # Close the previous timing chart window before opening a new one
-            # so figures and PhotoImages don't accumulate in memory.
-            # IMPORTANT: call _cleanup_func (not just .destroy()) so the
-            # FigureCanvasTkAgg ↔ Figure reference cycle is broken and the
-            # matplotlib figure's memory is released.  Plain .destroy() only
-            # tears down the Tk widget; it does NOT invoke the
-            # WM_DELETE_WINDOW protocol callback.
-            prev_win = getattr(self, '_timing_win', None)
-            self._timing_win = None
-            if prev_win is not None:
-                try:
-                    cleanup = getattr(prev_win, '_cleanup_func', None)
-                    if cleanup is not None:
-                        cleanup()
-                    else:
-                        prev_win.destroy()
-                except Exception:
-                    pass
-            prev_win = None  # drop reference BEFORE gc.collect() below
+            # _timing_win was already closed in _on_find_pattern before the
+            # background thread started; just open the new one here.
             self._timing_win = self.vm.show_timing_chart(timing)
-
-        # Force collection of any old PhotoImages (replaced label.image refs) on
-        # the main thread before the next background detection thread can trigger
-        # the cyclic GC and call PhotoImage.__del__ from the wrong thread.
-        import gc
-        gc.collect()
 
     def _on_show_orientations(self):
         if not self.state.template_loaded:

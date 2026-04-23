@@ -79,15 +79,23 @@ class PatternViewModel:
             if mode == 'Simple (Fast)':
                 cfg.ANGLE_STEP  = 360 # Will map to just [0] degrees
                 cfg.SCALE_MIN   = cfg.SCALE_MAX = 1.0
+                cfg.MAX_FINE_CANDIDATES = 3
             elif mode == 'With Rotation':
                 rot_deg = float(tk_vars['pattern_rot_var'].get())
                 cfg.ANGLE_STEP  = 10 if rot_deg > 0 else 360
                 cfg.SCALE_MIN   = cfg.SCALE_MAX = 1.0
+                cfg.MAX_FINE_CANDIDATES = 5
             else:  # Full Search
                 rot_deg = float(tk_vars['pattern_rot_var'].get())
                 cfg.ANGLE_STEP  = 10 if rot_deg > 0 else 360
                 cfg.SCALE_MIN   = 0.8
                 cfg.SCALE_MAX   = 1.2
+                # With 5 scales × 36 angles = 180 templates, the coarse pass
+                # can easily exclude the correct scale=1.0 match if
+                # MAX_FINE_CANDIDATES is too small.  Keep at least 4 candidates
+                # per scale level so the right match always reaches fine search.
+                n_scales = max(1, round((cfg.SCALE_MAX - cfg.SCALE_MIN) / cfg.SCALE_STEP) + 1)
+                cfg.MAX_FINE_CANDIDATES = max(15, n_scales * 4)
         except Exception as e:
             self._log(f"Pattern config error: {e}")
 
@@ -224,9 +232,20 @@ class PatternViewModel:
             self._log("Failed to read template image.")
             return None
 
-        from app.views.mask_editor import draw_detection_mask
-        mask = draw_detection_mask(template_img,
-                                   window_title="Draw Detection Region (L-click=add, R-click=close)")
+        from app.views.mask_editor import draw_detection_mask, auto_detect_ignore_mask
+
+        # Auto-detect wafer boundary → pre-populate the ignore zone
+        initial_mask = auto_detect_ignore_mask(template_img)
+        if initial_mask is not None:
+            self._log("Auto-detected wafer boundary — review and adjust in editor.")
+        else:
+            self._log("Auto-detection failed — please draw ignore region manually.")
+
+        mask = draw_detection_mask(
+            template_img,
+            window_title="IGNORE Region (red=excluded) — L-drag to add, R-drag to erase, Save to confirm",
+            initial_mask=initial_mask,
+        )
 
         if mask is None:
             self._log("ROI drawing cancelled — using full template.")

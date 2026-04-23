@@ -3,7 +3,7 @@
 # Build with:  pyinstaller WaferAligner_UI.spec
 
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_all
 
 # Bundle any icon / logo files present in the workspace root
 root_datas = []
@@ -16,17 +16,21 @@ recipe_datas = []
 if os.path.isdir('recipes'):
     recipe_datas.append(('recipes', 'recipes'))
 
+# scipy needs collect_all to bundle its compiled C extensions correctly
+scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
+
 a = Analysis(
     ['WaferAligner_UI.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=[*scipy_binaries],
     datas=[
         ('app', 'app'),          # entire app package
         ('Images', 'Images'),    # FOV classifier reference images
         *root_datas,
         *recipe_datas,
+        *scipy_datas,
     ],
-    hiddenimports=[
+    hiddenimports=[*scipy_hiddenimports,
         # tkinter and sub-modules
         'tkinter',
         'tkinter.ttk',
@@ -56,6 +60,10 @@ a = Analysis(
         'app.services.zmq_server',
         'app.models.app_state',
         'app.models.recipe_model',
+        # scipy — used by edge_finder for find_peaks
+        'scipy',
+        'scipy.signal',
+        'scipy.signal._peak_finding',
     ],
     hookspath=[],
     hooksconfig={},
@@ -64,7 +72,7 @@ a = Analysis(
         # Heavy ML packages not needed at runtime — reduces exe size significantly
         'torch', 'torchvision', 'onnxruntime',
         'langchain', 'chromadb', 'huggingface_hub',
-        'pandas', 'scipy', 'sklearn',
+        'pandas', 'sklearn',
         'IPython', 'jupyter', 'notebook',
     ],
     noarchive=False,

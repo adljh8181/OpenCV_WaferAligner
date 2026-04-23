@@ -140,6 +140,11 @@ class WaferAlignmentServer:
         self.template_crop_cx = 0.0
         self.template_crop_cy = 0.0
         self.edge_configs = {}
+        self._last_recipe_path = None   # cache: skip generate_templates if unchanged
+        # Autofocus session state (START_AUTOFOCUS_REQ / FOCUS_REQ)
+        self._af_heights    = []    # list[float]  Z heights collected so far
+        self._af_fmis       = []    # list[float]  FMI scores collected so far
+        self._af_step_count = 50    # total steps set by START_AUTOFOCUS_REQ
 
         # ZMQ setup
         self.context = zmq.Context()
@@ -200,8 +205,13 @@ class WaferAlignmentServer:
                         try: self.msg_rx_callback(raw)
                         except: pass
                         
-                    response = self._handle(raw)
-                    resp_str = json.dumps(response)
+                    response = self.ProcessCommand(raw)
+                    # _handle() may return a plain-text string (C# protocol
+                    # commands like FM_INDEX_REQ) or a JSON-serialisable dict.
+                    if isinstance(response, str):
+                        resp_str = response
+                    else:
+                        resp_str = json.dumps(response)
                     
                     if self.msg_tx_callback:
                         try: self.msg_tx_callback(resp_str)
@@ -209,8 +219,11 @@ class WaferAlignmentServer:
                         
                     self.socket.send_string(resp_str)
                     
-                    if response.get("status") == "ok" and \
-                            raw.strip().upper() == "SHUTDOWN":
+                    # SHUTDOWN check works for both dict and plain-text paths
+                    shutdown = (isinstance(response, dict) and
+                                response.get("status") == "ok" and
+                                raw.strip().upper() == "SHUTDOWN")
+                    if shutdown:
                         self._log("[SERVER] Shutdown requested. Exiting.")
                         break
         except KeyboardInterrupt:
@@ -222,7 +235,7 @@ class WaferAlignmentServer:
     # ------------------------------------------------------------------
     # Internal dispatcher
     # ------------------------------------------------------------------
-    def _handle(self, raw: str) -> dict:
+    def ProcessCommand(self, raw: str) -> dict:
         # 1. Split into Command and Arguments
         match = re.match(r'^(\S+)\s*(.*)$', raw.strip())
         if not match:
@@ -243,7 +256,10 @@ class WaferAlignmentServer:
         if cmd == "PM_REQ":
             if len(parameters) >= 2:
                 # First load the recipe, then run the match
-                self._load_recipe({"recipe_path": parameters[1]})
+                # Skip reload if the same recipe was already loaded
+                if parameters[1] != self._last_recipe_path:
+                    self._load_recipe({"recipe_path": parameters[1]})
+                    self._last_recipe_path = parameters[1]
                 # Match and get result
                 result = self._match({"search_path": parameters[0]})
                 
@@ -297,7 +313,10 @@ class WaferAlignmentServer:
                 # parameters[4] = "FORCE_RUN" — skip FOV check (optional)
                 # Note: FORCE_RUN is detected anywhere in parameters[3:] so polarity can be omitted.
 
-                self._load_recipe({"recipe_path": parameters[1]})
+                # Skip reload if the same recipe was already loaded
+                if parameters[1] != self._last_recipe_path:
+                    self._load_recipe({"recipe_path": parameters[1]})
+                    self._last_recipe_path = parameters[1]
 
                 # Detect FORCE_RUN anywhere in the optional parameters
                 force_run = any(p.upper() == "FORCE_RUN" for p in parameters[3:])
@@ -339,8 +358,94 @@ class WaferAlignmentServer:
 
         elif cmd == "LOADR_REQ":
             if len(parameters) >= 1:
+                self._last_recipe_path = None   # force fresh load
                 return self._load_recipe({"recipe_path": parameters[0]})
             return {"status": "error", "message": "LOADR_REQ requires 1 parameter"}
+
+        elif cmd == "START_AUTOFOCUS_REQ":
+            # START_AUTOFOCUS_REQ "<imagePath>" <zHeightStart> <stepNumber>
+            if len(parameters) >= 3:
+                try:
+                    z_start    = float(parameters[1])
+                    step_count = int(parameters[2])
+                except ValueError:
+                    return {"status": "error",
+                            "message": "START_AUTOFOCUS_REQ: zHeightStart and stepNumber must be numeric"}
+                return self._start_autofocus(parameters[0], z_start, step_count)
+            return {"status": "error",
+                    "message": "START_AUTOFOCUS_REQ requires 3 params: imagePath zHeightStart stepNumber"}
+
+        elif cmd == "FOCUS_REQ":
+            # FOCUS_REQ "<imagePath>" <zHeightCurrent>
+            if len(parameters) >= 2:
+                try:
+                    z_current = float(parameters[1])
+                except ValueError:
+                    return {"status": "error",
+                            "message": "FOCUS_REQ: zHeightFocus must be numeric"}
+                return self._autofocus_step(parameters[0], z_current)
+            return {"status": "error",
+                    "message": "FOCUS_REQ requires 2 params: imagePath zHeightFocus"}
+
+        elif cmd == "FM_INDEX_REQ":
+            # FM_INDEX_REQ "<imagePath>"
+            if len(parameters) >= 1:
+                return self._focus_measure_index(parameters[0])
+            return {"status": "error",
+                    "message": "FM_INDEX_REQ requires 1 param: imagePath"}
+
+        # 6. FindWaferAngle
+        # Command.Format("WAFER_ANGLE_REQ \"%s\"", ToVPServerFilePath)
+        elif cmd == "WAFER_ANGLE_REQ":
+            if len(parameters) == 1:
+                self._log(f"[SERVER] WAFER_ANGLE_REQ image={parameters[0]}")
+                return self._find_wafer_angle(parameters[0])
+            return {"status": "error", "message": "WAFER_ANGLE_REQ: Invalid Argument."}
+
+        # 7. CalcWaferCenter
+        # Command.Format("WAFER_CENTER_REQ %0.0f,%0.0f %0.0f,%0.0f %0.0f,%0.0f", x1,y1, x2,y2, x3,y3)
+        elif cmd == "WAFER_CENTER_REQ":
+            if len(parameters) == 3:
+                try:
+                    x1, y1 = (float(v) for v in parameters[0].split(","))
+                    x2, y2 = (float(v) for v in parameters[1].split(","))
+                    x3, y3 = (float(v) for v in parameters[2].split(","))
+                except (ValueError, IndexError):
+                    return {"status": "error", "message": "WAFER_CENTER_REQ: Invalid Argument."}
+                self._log(f"[SERVER] WAFER_CENTER_REQ ({x1},{y1}) ({x2},{y2}) ({x3},{y3})")
+                return self._calc_wafer_center(x1, y1, x2, y2, x3, y3)
+            return {"status": "error", "message": "WAFER_CENTER_REQ: Invalid Argument."}
+
+        # 8. FindWaferNotchEdge
+        # Command.Format("WAFER_NOTCH_REQ \"%s\" %d %f %f %f", ToVPServerFilePath, side, posX, posY, pixRes)
+        elif cmd == "WAFER_NOTCH_REQ":
+            if len(parameters) == 5:
+                try:
+                    side   = int(parameters[1])
+                    pos_x  = float(parameters[2])
+                    pos_y  = float(parameters[3])
+                    pix_res = float(parameters[4])
+                except ValueError:
+                    return {"status": "error", "message": "WAFER_NOTCH_REQ: Invalid Argument."}
+                self._log(f"[SERVER] WAFER_NOTCH_REQ image={parameters[0]} side={side} "
+                          f"posX={pos_x} posY={pos_y} pixRes={pix_res}")
+                return self._find_wafer_notch_edge(parameters[0], side, pos_x, pos_y, pix_res)
+            return {"status": "error", "message": "WAFER_NOTCH_REQ: Invalid Argument."}
+
+        # 9. FindWaferTemplate
+        # Command.Format("WAFER_TEMPLATE_REQ \"%s\" %f %f %f", ToVPServerFilePath, posX, posY, pixRes)
+        elif cmd == "WAFER_TEMPLATE_REQ":
+            if len(parameters) == 4:
+                try:
+                    pos_x   = float(parameters[1])
+                    pos_y   = float(parameters[2])
+                    pix_res = float(parameters[3])
+                except ValueError:
+                    return {"status": "error", "message": "WAFER_TEMPLATE_REQ: Invalid Argument."}
+                self._log(f"[SERVER] WAFER_TEMPLATE_REQ image={parameters[0]} "
+                          f"posX={pos_x} posY={pos_y} pixRes={pix_res}")
+                return self._find_wafer_template(parameters[0], pos_x, pos_y, pix_res)
+            return {"status": "error", "message": "WAFER_TEMPLATE_REQ: Invalid Argument."}
 
         elif cmd == "PING":
             return {"status": "pong"}
@@ -351,6 +456,373 @@ class WaferAlignmentServer:
         else:
             self._log(f"[SERVER] Unknown command: {cmd}")
             return {"status": "error", "message": f"Unknown command: {cmd}"}
+
+    # ------------------------------------------------------------------
+    # Autofocus helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_fmi(image_path: str) -> float:
+        """
+        Focus Measure Index - Laplacian Variance.
+        Matches C# EmguVision.GetSharpnessLaplacianVariance().
+        Higher value = sharper / better-focused image.
+        """
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Cannot read image: {image_path}")
+        laplacian = cv2.Laplacian(img, cv2.CV_64F)
+        _, std_dev = cv2.meanStdDev(laplacian)
+        return float(std_dev[0][0] ** 2)    # variance = stddev^2
+
+    def _peak_detection(self, fmis: list,
+                        window_half_size: int = 2,
+                        threshold_perc: float = 0.05) -> list:
+        """
+        Sliding-window local-maxima detector.
+        Matches C# MainWindowViewModel.PeakDetection().
+
+        A candidate i is a peak when:
+          1. fmis[i] is strictly greater than every neighbour in +/-window_half_size.
+          2. fmis[i] exceeds the neighbourhood average by >= threshold_perc (default 5%).
+
+        Returns sorted list of peak indices.
+        """
+        peaks = []
+        n = len(fmis)
+        for i in range(n):
+            center  = fmis[i]
+            start   = max(0, i - window_half_size)
+            end     = min(n - 1, i + window_half_size)
+            is_peak = True
+            avg_sum = 0.0
+            count   = 0
+            for j in range(start, end + 1):
+                if j == i:
+                    continue
+                if fmis[j] >= center:       # not strictly the local maximum
+                    is_peak = False
+                    break
+                avg_sum += fmis[j]
+                count   += 1
+            if not is_peak or count == 0:
+                continue
+            average = avg_sum / count
+            if average == 0:
+                continue
+            if (center - average) / average >= threshold_perc:
+                peaks.append(i)
+        return peaks
+
+    # ?? START_AUTOFOCUS_REQ ????????????????????????????????????????????????
+    def _start_autofocus(self, image_path: str,
+                         z_height_start: float,
+                         step_count: int) -> str:
+        """
+        Handle START_AUTOFOCUS_REQ.
+        Resets the session, measures FMI of the first image, returns direction UP.
+
+        Matches C# Process_Start_Autofocus():
+          - Clears AFHeights / AFFMIs buffers.
+          - Stores stepNumber as peak-detection window size.
+          - Computes FMI, appends (zHeightStart, score) to buffers.
+          - Deletes the image file.
+
+        Command:  START_AUTOFOCUS_REQ "<imagePath>" <zHeightStart> <stepNumber>
+        Reply OK: "START_AUTOFOCUS_OK <score> UP"   (score to 3 d.p.)
+        Reply ERR:"ERR ImageNotFound"
+        """
+        if not os.path.isfile(image_path):
+            self._log(f"[AUTOFOCUS] Image not found: {image_path}")
+            return "ERR ImageNotFound"
+
+        # Reset session state (mirrors AFHeights.Clear(), AFFMIs.Clear(), bFocusFound=false)
+        self._af_heights    = []
+        self._af_fmis       = []
+        self._af_step_count = step_count
+
+        try:
+            fmi = self._compute_fmi(image_path)
+        except Exception as exc:
+            self._log(f"[AUTOFOCUS] Error computing FMI: {exc}")
+            return "ERR ImageNotFound"
+
+        self._af_heights.append(z_height_start)
+        self._af_fmis.append(fmi)
+
+        self._log(f"[AUTOFOCUS] START  z={z_height_start:.3f}  fmi={fmi:.3f}  "
+                  f"target_steps={step_count}")
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+
+        return f"START_AUTOFOCUS_OK {fmi:.3f} UP"
+
+    # ?? FOCUS_REQ ??????????????????????????????????????????????????????????
+    def _autofocus_step(self, image_path: str, z_height: float) -> str:
+        """
+        Handle FOCUS_REQ.
+        Appends FMI to session list. Runs peak detection when enough steps
+        have been collected.
+
+        Matches C# Process_Autofocus():
+          - Appends (zHeightFocus, score) to AFHeights / AFFMIs.
+          - While still collecting: replies with direction UP.
+          - Once AFFMIs.Count >= AFStepNumber: runs PeakDetection().
+            - Peak found  -> "FOCUS_OK <score> STOP <bestHeight>"
+            - No peak     -> "FOCUS_ERR"
+          - Deletes the image file.
+
+        Command:  FOCUS_REQ "<imagePath>" <zHeightCurrent>
+        Reply (still collecting): "FOCUS_OK <score> UP"
+        Reply (peak found):       "FOCUS_OK <score> STOP <bestHeight>"
+        Reply (no peak):          "FOCUS_ERR"
+        Reply (image missing):    "ERR ImageNotFound"
+        """
+        if not os.path.isfile(image_path):
+            self._log(f"[AUTOFOCUS] Image not found: {image_path}")
+            return "ERR ImageNotFound"
+
+        try:
+            fmi = self._compute_fmi(image_path)
+        except Exception as exc:
+            self._log(f"[AUTOFOCUS] Error computing FMI: {exc}")
+            return "ERR ImageNotFound"
+
+        self._af_heights.append(z_height)
+        self._af_fmis.append(fmi)
+        collected = len(self._af_fmis)
+
+        self._log(f"[AUTOFOCUS] STEP {collected}/{self._af_step_count}  "
+                  f"z={z_height:.3f}  fmi={fmi:.3f}")
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+
+        # Still collecting — keep moving UP
+        if collected < self._af_step_count:
+            return f"FOCUS_OK {fmi:.3f} UP"
+
+        # Enough steps — run sliding-window peak detection
+        peaks = self._peak_detection(self._af_fmis)
+        if peaks:
+            best_idx    = peaks[0]          # first (bottom-most) peak, mirrors C# peaks[0]
+            best_height = self._af_heights[best_idx]
+            self._log(f"[AUTOFOCUS] Peak at step={best_idx}  "
+                      f"z={best_height:.3f}  fmi={self._af_fmis[best_idx]:.3f}")
+            return f"FOCUS_OK {fmi:.3f} STOP {best_height:.3f}"
+
+        self._log("[AUTOFOCUS] No peak found after full scan.")
+        return "FOCUS_ERR"
+
+    # ?? FM_INDEX_REQ ???????????????????????????????????????????????????????
+    def _focus_measure_index(self, image_path: str) -> str:
+        """
+        Handle FM_INDEX_REQ.
+        Standalone one-shot FMI - no session state.
+        The machine controller manages the Z-stage logic itself.
+
+        Matches C# Process_FindFocusIndex() / EmguVision.InspectFocusMeasureIndex().
+
+        Command:  FM_INDEX_REQ "<imagePath>"
+        Reply OK: "FM_INDEX_OK <score>"   (score to 3 d.p.)
+        Reply ERR:"ERR ImageNotFound"
+        """
+        if not os.path.isfile(image_path):
+            self._log(f"[FMI] Image not found: {image_path}")
+            return "ERR ImageNotFound"
+
+        try:
+            fmi = self._compute_fmi(image_path)
+        except Exception as exc:
+            self._log(f"[FMI] Error computing FMI: {exc}")
+            return "ERR ImageNotFound"
+
+        self._log(f"[FMI] fmi={fmi:.3f}  image={os.path.basename(image_path)}")
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+
+        return f"FM_INDEX_OK {fmi:.3f}"
+
+    # ------------------------------------------------------------------
+    # Stub handlers — to be implemented
+    # ------------------------------------------------------------------
+
+    def _find_wafer_angle(self, image_path: str) -> dict:
+        """
+        Handle WAFER_ANGLE_REQ.
+        Matches C# Process_FindWaferAngle().
+
+        Command:  WAFER_ANGLE_REQ "<imagePath>"
+        Reply:    "Command Not Supported."
+        """
+        # C# Process_FindWaferAngle() note: "not used anywhere in ChapAnalyze"
+        self._log("[WAFER_ANGLE] Command not supported.")
+        return "Command Not Supported."
+
+    def _calc_wafer_center(self,
+                           x1: float, y1: float,
+                           x2: float, y2: float,
+                           x3: float, y3: float) -> str:
+        """
+        Handle WAFER_CENTER_REQ.
+        Finds the circumcircle centre of three edge points using perpendicular
+        bisectors — matches C# Process_CalcWaferCenter() / Line.GetPerpendicularBisector().
+
+        Math
+        ----
+        Each bisector passes through the midpoint of a segment and is
+        perpendicular to it.  Their intersection is the wafer centre.
+
+        Parametric form used here to handle all slopes (avoids div-by-zero):
+            Bisector of p1-p2 : mid12 + t * (dy12, -dx12)
+            Bisector of p2-p3 : mid23 + s * (dy23, -dx23)
+        Solve for t via Cramer's rule, then substitute.
+
+        Command:  WAFER_CENTER_REQ x1,y1 x2,y2 x3,y3
+        Reply OK: "WAFER_CENTER_OK <cx> <cy>"   (3 d.p.)
+        Reply ERR:"WAFER_CENTER_ERR Points are collinear"
+        """
+        mid12_x = (x1 + x2) / 2.0
+        mid12_y = (y1 + y2) / 2.0
+        dx12 = x2 - x1
+        dy12 = y2 - y1
+
+        mid23_x = (x2 + x3) / 2.0
+        mid23_y = (y2 + y3) / 2.0
+        dx23 = x3 - x2
+        dy23 = y3 - y2
+
+        # det of coefficient matrix [[dy12, -dy23], [-dx12, dx23]]
+        det = dy12 * dx23 - dy23 * dx12
+        if abs(det) < 1e-10:
+            self._log("[WAFER_CENTER] Points are collinear — cannot find centre.")
+            return "WAFER_CENTER_ERR Points are collinear"
+
+        bx = mid23_x - mid12_x
+        by = mid23_y - mid12_y
+
+        # Cramer's rule: t = det([[bx,-dy23],[by,dx23]]) / det
+        t = (bx * dx23 + dy23 * by) / det
+
+        cx = mid12_x + t * dy12
+        cy = mid12_y - t * dx12
+
+        self._log(f"[WAFER_CENTER] center=({cx:.3f}, {cy:.3f})")
+        return f"WAFER_CENTER_OK {cx:.3f} {cy:.3f}"
+
+    def _find_wafer_notch_edge(self,
+                               image_path: str,
+                               side: int,
+                               pos_x: float, pos_y: float,
+                               pix_res: float) -> str:
+        """
+        Handle WAFER_NOTCH_REQ.
+        Matches C# Process_FindWaferNotchEdge(imagePath, side, posX, posY, pixRes).
+
+        Input validation mirrors C# (file-exists and pixRes > 0 checks).
+        The inner InspectNotchOffset() logic has no Python equivalent yet.
+
+        Command:  WAFER_NOTCH_REQ "<imagePath>" <side> <posX> <posY> <pixRes>
+        Reply OK: "WAFER_NOTCH_OK <offsetX> <offsetY>"
+        Reply ERR:"ERR ImageNotFound" | "ERR Invalid Pixel Resolution" | "WAFER_NOTCH_ERR ..."
+        """
+        if not os.path.isfile(image_path):
+            self._log(f"[WAFER_NOTCH] Image not found: {image_path}")
+            return "ERR ImageNotFound"
+        if pix_res <= 0.0:
+            self._log("[WAFER_NOTCH] Invalid pixel resolution.")
+            return "ERR Invalid Pixel Resolution"
+
+        # TODO: implement InspectNotchOffset equivalent
+        self._log(f"[WAFER_NOTCH] Not yet implemented. "
+                  f"side={side} pos=({pos_x},{pos_y}) res={pix_res}")
+        return "WAFER_NOTCH_ERR Not yet implemented"
+
+    def _find_wafer_template(self,
+                             image_path: str,
+                             pos_x: float, pos_y: float,
+                             pix_res: float) -> str:
+        """
+        Handle WAFER_TEMPLATE_REQ.
+        Matches C# Process_FindWaferTemplate() / EmguVision.InspectFeatureOffset() / WC_REQ().
+
+        Algorithm
+        ---------
+        1. Validates image and pixRes.
+        2. Loads the template (and optional mask) from the current recipe's
+           FindPattern.TemplatePath / DetectionMaskPath.
+        3. Runs cv2.matchTemplate (TM_CCORR_NORMED) — matches C# CcorrNormed.
+        4. Finds best match location; computes offset from the template crop
+           centre (TemplateCropCX / TemplateCropCY) multiplied by pixRes.
+        5. Adds offset to (posX, posY) and replies.
+
+        Command:  WAFER_TEMPLATE_REQ "<imagePath>" <posX> <posY> <pixRes>
+        Reply OK: "WAFER_TEMPLATE_OK <score> <finalX> <finalY>"   (3 d.p.)
+        Reply ERR:"ERR ImageNotFound" | "ERR Invalid Pixel Resolution" |
+                  "WAFER_TEMPLATE_ERR ..."
+        """
+        if not os.path.isfile(image_path):
+            self._log(f"[WAFER_TEMPLATE] Image not found: {image_path}")
+            return "ERR ImageNotFound"
+        if pix_res <= 0.0:
+            self._log("[WAFER_TEMPLATE] Invalid pixel resolution.")
+            return "ERR Invalid Pixel Resolution"
+
+        # Retrieve template info from the loaded recipe
+        if not self._last_recipe_path:
+            return "WAFER_TEMPLATE_ERR No recipe loaded"
+        try:
+            recipe = self.recipe_mgr.load_recipe(self._last_recipe_path)
+        except Exception as exc:
+            return f"WAFER_TEMPLATE_ERR Failed to load recipe: {exc}"
+
+        fp = recipe.get("find_pattern", {})
+        tmpl_path = fp.get("TemplatePath", "")
+        mask_path = fp.get("DetectionMaskPath", "")
+        crop_cx   = float(fp.get("TemplateCropCX", 0.0))
+        crop_cy   = float(fp.get("TemplateCropCY", 0.0))
+
+        if not tmpl_path or not os.path.isfile(tmpl_path):
+            self._log("[WAFER_TEMPLATE] No template image in recipe.")
+            return "WAFER_TEMPLATE_ERR No template loaded"
+
+        # Load images
+        img  = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        tmpl = cv2.imread(tmpl_path,  cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return "ERR ImageNotFound"
+        if tmpl is None:
+            return "WAFER_TEMPLATE_ERR Template image could not be read"
+
+        mask = None
+        if mask_path and os.path.isfile(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+        # Template matching — CcorrNormed (mirrors C# TemplateMatchingType.CcorrNormed)
+        result = cv2.matchTemplate(img, tmpl, cv2.TM_CCORR_NORMED, mask=mask)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        # Centre of the matched region in the search image (pixels)
+        found_cx = max_loc[0] + tmpl.shape[1] / 2.0
+        found_cy = max_loc[1] + tmpl.shape[0] / 2.0
+
+        # Offset from expected centre * pixRes → real-world units
+        # Mirrors: x = dFndXOffset * PixelResolution in C# InspectFeatureOffset()
+        offset_x = (found_cx - crop_cx) * pix_res
+        offset_y = (found_cy - crop_cy) * pix_res
+
+        final_x = pos_x + offset_x
+        final_y = pos_y + offset_y
+
+        self._log(f"[WAFER_TEMPLATE] score={max_val:.3f}  "
+                  f"offset=({offset_x:.3f},{offset_y:.3f})  "
+                  f"result=({final_x:.3f},{final_y:.3f})")
+        return f"WAFER_TEMPLATE_OK {max_val:.3f} {final_x:.3f} {final_y:.3f}"
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -583,16 +1055,19 @@ class WaferAlignmentServer:
             if "TSpread" in fp:
                 t = int(fp["TSpread"])
                 m_cfg.T_PYRAMID = [t, t*2, t*4]
-                m_cfg.PYRAMID_LEVELS = 3
             if "HystKernel" in fp:     m_cfg.HYSTERESIS_KERNEL = int(fp["HystKernel"])
             
             mode = fp.get("SearchMode", "Simple (Fast)")
             if mode == 'Simple (Fast)':
                 m_cfg.ANGLE_STEP = 360; m_cfg.SCALE_MIN = m_cfg.SCALE_MAX = 1.0
+                m_cfg.MAX_FINE_CANDIDATES = 3
             elif mode == 'With Rotation':
-                m_cfg.ANGLE_STEP = 5; m_cfg.SCALE_MIN = m_cfg.SCALE_MAX = 1.0
-            else:
-                m_cfg.ANGLE_STEP = 5; m_cfg.SCALE_MIN = 0.8; m_cfg.SCALE_MAX = 1.2
+                m_cfg.ANGLE_STEP = 10; m_cfg.SCALE_MIN = m_cfg.SCALE_MAX = 1.0
+                m_cfg.MAX_FINE_CANDIDATES = 5
+            else:  # Full Search
+                m_cfg.ANGLE_STEP = 10; m_cfg.SCALE_MIN = 0.8; m_cfg.SCALE_MAX = 1.2
+                n_scales = max(1, round((m_cfg.SCALE_MAX - m_cfg.SCALE_MIN) / m_cfg.SCALE_STEP) + 1)
+                m_cfg.MAX_FINE_CANDIDATES = max(15, n_scales * 4)
 
             self.template_crop_cx = float(fp.get("TemplateCropCX", 0.0))
             self.template_crop_cy = float(fp.get("TemplateCropCY", 0.0))
@@ -600,7 +1075,7 @@ class WaferAlignmentServer:
             # 2. Apply Edge params
             self.edge_configs = r.get("find_edge", {})
 
-            # 3. Load Template Image
+            # 3. Load Template Image (+ detection mask if one exists alongside it)
             tpath = fp.get("TemplatePath", "")
             if tpath:
                 if not os.path.isfile(tpath):
@@ -611,7 +1086,15 @@ class WaferAlignmentServer:
                 if os.path.isfile(tpath):
                     img = cv2.imread(tpath, cv2.IMREAD_GRAYSCALE)
                     if img is not None:
-                        self.matcher.load_template(img)
+                        # Load detection mask from disk if it exists (e.g. template_mask.png)
+                        base, ext = os.path.splitext(tpath)
+                        mask_path = base + "_mask.png"
+                        detection_mask = None
+                        if os.path.isfile(mask_path):
+                            detection_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                            if detection_mask is not None:
+                                self._log(f"[SERVER] Loaded detection mask: {mask_path}")
+                        self.matcher.load_template(img, detection_mask=detection_mask)
                         self.matcher.generate_templates()
                         self._template_loaded = True
                     else:

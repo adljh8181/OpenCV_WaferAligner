@@ -118,7 +118,7 @@ class EdgeTab:
         # Slider params: (label, StringVar attr, default, min, max, res, fmt)
         slider_params = [
             ("Kernel Size:",     self.edge_kernel_var,  "9",     3,    201,   2,     "{:.0f}"),
-            ("Edge Threshold:",  self.edge_thresh_var,  "80",    1,    5000,  1,     "{:.0f}"),
+            ("Edge Threshold:",  self.edge_thresh_var,  "80",    1,    20000, 1,     "{:.0f}"),
             ("Scan Regions:",    self.edge_regions_var, "30",    5,    100,   1,     "{:.0f}"),
             ("Border Ignore %:", self.edge_border_var,  "0.050", 0.0,  0.25,  0.005, "{:.3f}"),
             ("RANSAC Thresh:",   self.edge_ransac_var,  "3.0",   0.5,  20.0,  0.5,   "{:.1f}"),

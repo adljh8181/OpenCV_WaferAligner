@@ -7,48 +7,48 @@
   <FindWaferEdge>
     <UseUniversalParams>True</UseUniversalParams>
     <WaferAlignLeftParam Name="WaferAlign Left Parm">
-      <KernelSize>120</KernelSize>
-      <EdgeThreshold>4724</EdgeThreshold>
-      <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.050</BorderIgnorePct>
-      <RansacThreshold>3.0</RansacThreshold>
-      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
+      <KernelSize>199</KernelSize>
+      <EdgeThreshold>4134</EdgeThreshold>
+      <NumRegions>40</NumRegions>
+      <BorderIgnorePct>0.020</BorderIgnorePct>
+      <RansacThreshold>5.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignLeftParam>
     <WaferAlignRightParam Name="WaferAlign Right Parm">
-      <KernelSize>120</KernelSize>
-      <EdgeThreshold>4724</EdgeThreshold>
-      <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.050</BorderIgnorePct>
-      <RansacThreshold>3.0</RansacThreshold>
-      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
+      <KernelSize>199</KernelSize>
+      <EdgeThreshold>4134</EdgeThreshold>
+      <NumRegions>40</NumRegions>
+      <BorderIgnorePct>0.020</BorderIgnorePct>
+      <RansacThreshold>5.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignRightParam>
     <WaferAlignTopParam Name="WaferAlign Top Parm">
-      <KernelSize>120</KernelSize>
-      <EdgeThreshold>4724</EdgeThreshold>
-      <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.050</BorderIgnorePct>
-      <RansacThreshold>3.0</RansacThreshold>
-      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
+      <KernelSize>199</KernelSize>
+      <EdgeThreshold>4134</EdgeThreshold>
+      <NumRegions>40</NumRegions>
+      <BorderIgnorePct>0.020</BorderIgnorePct>
+      <RansacThreshold>5.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignTopParam>
     <WaferAlignBotParam Name="WaferAlign Bot Parm">
-      <KernelSize>120</KernelSize>
-      <EdgeThreshold>4724</EdgeThreshold>
-      <NumRegions>30</NumRegions>
-      <BorderIgnorePct>0.050</BorderIgnorePct>
-      <RansacThreshold>3.0</RansacThreshold>
-      <EdgePolarity>DARK_TO_LIGHT</EdgePolarity>
+      <KernelSize>199</KernelSize>
+      <EdgeThreshold>4134</EdgeThreshold>
+      <NumRegions>40</NumRegions>
+      <BorderIgnorePct>0.020</BorderIgnorePct>
+      <RansacThreshold>5.0</RansacThreshold>
+      <EdgePolarity>ANY</EdgePolarity>
     </WaferAlignBotParam>
   </FindWaferEdge>
   <FindPattern>
-    <MatchThreshold>80.3</MatchThreshold>
+    <MatchThreshold>0.0</MatchThreshold>
     <NumFeatures>512</NumFeatures>
     <GradThrPct>90.0</GradThrPct>
     <TSpread>1</TSpread>
     <HystKernel>0</HystKernel>
     <SearchMode>Simple (Fast)</SearchMode>
     <TemplatePath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template.png</TemplatePath>
-    <TemplateCropCX>2295.0</TemplateCropCX>
-    <TemplateCropCY>3485.0</TemplateCropCY>
+    <TemplateCropCX>2289.0</TemplateCropCX>
+    <TemplateCropCY>3477.0</TemplateCropCY>
     <DetectionMaskPath>C:\Users\adrain.lim\OneDrive - QES (Asia-Pacific) Sdn Bhd\Desktop\EmguFindEdge\recipes\TKX2_template_mask.png</DetectionMaskPath>
   </FindPattern>
 </Recipe>

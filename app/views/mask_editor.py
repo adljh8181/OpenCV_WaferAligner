@@ -45,14 +45,57 @@ def _point_in_rect(px, py, rect):
     return rx <= px <= rx + rw and ry <= py <= ry + rh
 
 
-def draw_detection_mask(template_img, window_title="Paint Detection Region"):
+def auto_detect_ignore_mask(img: np.ndarray,
+                             dilate_px: int = 4) -> np.ndarray | None:
+    """
+    Automatically build an IGNORE mask (255=ignore, 0=use) by extracting
+    the dark/black edges in the template image.
+
+    Strategy
+    --------
+    1. Convert to grayscale.
+    2. Apply Otsu thresholding — dark pixels (edges/borders) → keep,
+       light pixels (background) → ignore.
+    3. Dilate the dark region slightly so thin edges get full coverage.
+    4. ignore_mask = invert of the dark region
+       (255 where light/background, 0 where dark edge → match)
+
+    Returns uint8 mask same size as img (255=ignore, 0=match), or None.
+    """
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+
+    # Light blur to reduce sensor noise before thresholding
+    blur = cv2.GaussianBlur(gray, (0, 0), 2)
+
+    # Otsu: separates dark edges from light background automatically
+    _, thresh = cv2.threshold(blur, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Dilate to thicken thin edges so the red overlay is easy to see/erase
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        thresh = cv2.dilate(thresh, k, iterations=1)
+
+    # thresh = 255 where dark (match region)
+    # ignore_mask = 255 where light (background) = bitwise_not
+    return cv2.bitwise_not(thresh)
+
+
+def draw_detection_mask(template_img, window_title="Paint Detection Region",
+                        initial_mask: np.ndarray | None = None):
     """
     Open an interactive OpenCV window to paint a mask on the template
     using a circular brush.
 
     Args:
-        template_img: Template image (grayscale or BGR).
-        window_title: Window title.
+        template_img:  Template image (grayscale or BGR).
+        window_title:  Window title.
+        initial_mask:  Optional pre-computed IGNORE mask (255=ignore, 0=match)
+                       to pre-populate the brush canvas.  User can still refine.
 
     Returns:
         np.ndarray: Binary mask (uint8, 255/0), same size as template_img,
@@ -90,11 +133,17 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
         bg_display = base_img.copy()
 
     # Mask at DISPLAY resolution (fast painting — upscale on confirm)
-    disp_mask = np.zeros((disp_h, disp_w), dtype=np.uint8)
+    # Pre-populate from initial_mask if provided
+    if initial_mask is not None:
+        init_resized = cv2.resize(initial_mask, (disp_w, disp_h),
+                                  interpolation=cv2.INTER_NEAREST)
+        disp_mask = (init_resized > 127).astype(np.uint8) * 255
+    else:
+        disp_mask = np.zeros((disp_h, disp_w), dtype=np.uint8)
 
-    # Green overlay layer (pre-allocated)
+    # Red overlay layer (pre-allocated) — painted = IGNORE zone
     green_layer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
-    green_layer[:, :] = (0, 130, 0)
+    green_layer[:, :] = (0, 0, 180)
 
     # Brush settings (in display coordinates)
     brush_radius = max(3, min(disp_w, disp_h) // 30)
@@ -135,7 +184,7 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
         # Instructions (small, top-left)
         font_scale = max(0.35, 0.45 * (disp_w / 800))
         lines = [
-            "L-drag: paint | R-drag: erase | Scroll: brush size | R: reset",
+            "L-drag: mark IGNORE | R-drag: erase | Scroll: brush size | R: reset",
         ]
         for i, txt in enumerate(lines):
             y = 16 + i * 16
@@ -253,13 +302,15 @@ def draw_detection_mask(template_img, window_title="Paint Detection Region"):
         elif key in (13, 10):  # Enter → confirm
             if np.any(disp_mask > 0):
                 if disp_scale < 1.0:
-                    result_mask = cv2.resize(disp_mask, (w, h),
-                                            interpolation=cv2.INTER_NEAREST)
+                    painted = cv2.resize(disp_mask, (w, h),
+                                         interpolation=cv2.INTER_NEAREST)
                 else:
-                    result_mask = disp_mask.copy()
-                result_mask = (result_mask > 127).astype(np.uint8) * 255
+                    painted = disp_mask.copy()
+                painted = (painted > 127).astype(np.uint8) * 255
+                # Invert: painted = ignore zone → matching region = unpainted
+                result_mask = cv2.bitwise_not(painted)
             else:
-                result_mask = None
+                result_mask = None  # nothing drawn → no mask (use full image)
             break
 
         if needs_redraw:

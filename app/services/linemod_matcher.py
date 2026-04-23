@@ -73,8 +73,9 @@ class LinemodConfig:
 
         # --- Performance ---
         self.FAST_SEARCH_QUANTIZE = True        # Skip hysteresis on search images
-        self.COARSE_NUM_FEATURES  = 128          # Fewer features for coarse scanning
+        self.COARSE_NUM_FEATURES  = 32           # Fewer features for coarse scanning (first 32 are highest-quality)
         self.MAX_COARSE_CANDIDATES = 2           # Number of top candidates to keep per template at coarse level
+        self.MAX_FINE_CANDIDATES  = 5            # Cap coarse candidates before fine pass to limit super-ROI size
 
     @property
     def PYRAMID_LEVELS(self):
@@ -93,11 +94,15 @@ class Feature:
 
 class TemplatePyr:
     """Features for one pyramid level."""
-    __slots__ = ['width', 'height', 'tl_x', 'tl_y', 'pyramid_level', 'features']
+    __slots__ = ['width', 'height', 'tl_x', 'tl_y', 'pyramid_level', 'features',
+                 'feat_xs_arr', 'feat_ys_arr', 'feat_labels_arr']
     def __init__(self):
         self.width = 0; self.height = 0
         self.tl_x = 0; self.tl_y = 0
         self.pyramid_level = 0; self.features = []
+        self.feat_xs_arr = None
+        self.feat_ys_arr = None
+        self.feat_labels_arr = None
 
 
 # ======================================================================
@@ -516,6 +521,13 @@ class LinemodMatcher:
                 templates.append(t)
 
             _crop_templates(templates)
+            # Pre-cache numpy arrays for each level so inner scoring loops
+            # avoid per-feature Python attribute access overhead.
+            for t in templates:
+                if t.features:
+                    t.feat_xs_arr     = np.array([f.x     for f in t.features], dtype=np.int32)
+                    t.feat_ys_arr     = np.array([f.y     for f in t.features], dtype=np.int32)
+                    t.feat_labels_arr = np.array([f.label for f in t.features], dtype=np.int32)
             return {
                 'angle': angle, 'scale': scale,
                 'templates': templates,
@@ -604,14 +616,7 @@ class LinemodMatcher:
 
         if use_pyramid:
             matches, inner_timing = self._match_pyramid(search_gray, threshold)
-            # Robust fallback: if pyramid found nothing (coarse was off or ROI
-            # missed), retry with the reliable full-image single-level scan.
-            if not matches:
-                print("  [Pyramid] 0 matches — falling back to full-image scan")
-                matches, inner_timing = self._match_single_level(search_gray, threshold)
-                inner_timing['mode'] = 'Single-Level (fallback)'
-            else:
-                inner_timing['mode'] = 'Pyramid'
+            inner_timing['mode'] = 'Pyramid'
         else:
             matches, inner_timing = self._match_single_level(search_gray, threshold)
             inner_timing['mode'] = 'Single-Level'
@@ -629,6 +634,11 @@ class LinemodMatcher:
         matches = self._nms(matches)
         matches.sort(key=lambda m: m['score'], reverse=True)
         t_nms = (_time.perf_counter() - t0_nms) * 1000
+
+        # Angular sub-pixel refinement: only meaningful when multiple rotation
+        # templates were used and we have at least one match.
+        if matches and len(self.template_pyramids) > 1:
+            matches[0] = self._angular_interpolate(matches)
 
         # Persist timing for ViewModel to harvest
         self._last_timing = {
@@ -678,8 +688,8 @@ class LinemodMatcher:
         # Pre-cast response maps to int32 once to avoid massive temporary
         # allocations inside the inner loop (numpy would upcast on each +=
         # otherwise).  Release spread_q and quantized now — no longer needed.
-        rmaps_int32 = [r.astype(np.int32) for r in rmaps]
-        del rmaps, spread_q  # free uint8 maps; int32 copies are in rmaps_int32
+        rmaps_int16 = [r.astype(np.int16) for r in rmaps]
+        del rmaps, spread_q  # free uint8 maps; int16 copies halve memory bandwidth
         timing['response_maps_ms'] = (_time.perf_counter() - t0) * 1000
 
         t0 = _time.perf_counter()
@@ -687,8 +697,7 @@ class LinemodMatcher:
 
         for tp_idx, tp in enumerate(self.template_pyramids):
             templ = tp['templates'][0]  # Level 0 template
-            n_feats = len(templ.features)
-            if n_feats == 0:
+            if templ.feat_xs_arr is None or len(templ.feat_xs_arr) == 0:
                 continue
 
             tw = templ.width
@@ -700,27 +709,32 @@ class LinemodMatcher:
             if vy <= 0 or vx <= 0:
                 continue
 
-            # Vectorized scoring: sum response slices
-            score_map = np.zeros((vy, vx), dtype=np.int32)
-            valid_feats = 0
-
-            for feat in templ.features:
-                fx, fy = feat.x, feat.y
-                y_end = fy + vy
-                x_end = fx + vx
-                if y_end <= sh and x_end <= sw and fy >= 0 and fx >= 0:
-                    score_map += rmaps_int32[feat.label][fy:y_end, fx:x_end]
-                    valid_feats += 1
+            # Vectorized bounds check using cached numpy arrays
+            xs_a = templ.feat_xs_arr
+            ys_a = templ.feat_ys_arr
+            ls_a = templ.feat_labels_arr
+            valid_mask = (ys_a + vy <= sh) & (xs_a + vx <= sw) & (ys_a >= 0) & (xs_a >= 0)
+            valid_xs = xs_a[valid_mask].tolist()
+            valid_ys = ys_a[valid_mask].tolist()
+            valid_ls = ls_a[valid_mask].tolist()
+            valid_feats = len(valid_xs)
 
             if valid_feats == 0:
-                del score_map
                 continue
 
+            # int16 score_map: max accumulated = 128 feats × 4 = 512 < 32767
+            score_map = np.zeros((vy, vx), dtype=np.int16)
+
+            # Label-grouped loop: same rmap slice accessed consecutively
+            # → better L2 cache hit rate vs interleaved label access.
+            order = np.argsort(valid_ls)
+            for i in order:
+                label, fy, fx = valid_ls[i], valid_ys[i], valid_xs[i]
+                score_map += rmaps_int16[label][fy:fy+vy, fx:fx+vx]
+
             # Normalize: max score per feature = 4
-            # Use float32 (not float64) to halve the memory footprint of
-            # sim_map — accuracy to 0.001% is more than sufficient.
             max_possible = 4 * valid_feats
-            sim_map = (score_map * np.float32(100.0)) / np.float32(max_possible)
+            sim_map = (score_map.astype(np.float32) * np.float32(100.0)) / np.float32(max_possible)
             del score_map  # no longer needed; release before further allocs
 
             # Find candidates with NMS
@@ -735,12 +749,26 @@ class LinemodMatcher:
             nms_dist_sq = cfg.NMS_DISTANCE ** 2
             kept = []
             img_w, img_h = tp['size']
+            scale = tp['scale']
+
+            # Scale-aware position correction: the standard formula
+            # cx = c_i - tl_x + img_w//2 is exact only for scale=1.0.
+            # For scale s matching a 1.0× pattern, the peak of the score map
+            # is offset from the true pattern centre by (1−s)/s × (mean canvas
+            # feature position − canvas centre).  Correct that here.
+            if abs(scale - 1.0) > 0.01 and templ.feat_xs_arr is not None and len(templ.feat_xs_arr) > 0:
+                mean_cfx = float(np.mean(templ.feat_xs_arr)) + templ.tl_x
+                mean_cfy = float(np.mean(templ.feat_ys_arr)) + templ.tl_y
+                scale_corr_x = (scale - 1.0) / scale * (mean_cfx - img_w // 2)
+                scale_corr_y = (scale - 1.0) / scale * (mean_cfy - img_h // 2)
+            else:
+                scale_corr_x = scale_corr_y = 0.0
 
             for idx in order:
                 r_i, c_i = int(ys[idx]), int(xs[idx])
                 dx, dy = _subpixel_refine(sim_map, r_i, c_i)
-                cx = c_i + dx - templ.tl_x + img_w // 2
-                cy = r_i + dy - templ.tl_y + img_h // 2
+                cx = c_i + dx - templ.tl_x + img_w // 2 + scale_corr_x
+                cy = r_i + dy - templ.tl_y + img_h // 2 + scale_corr_y
                 s = float(scores[idx])
 
                 dup = False
@@ -761,7 +789,7 @@ class LinemodMatcher:
             del sim_map  # release before next template iteration
             all_matches.extend(kept)
 
-        del rmaps_int32  # release the 8 int32 response maps
+        del rmaps_int16  # release the 8 int16 response maps
         timing['scoring_ms'] = (_time.perf_counter() - t0) * 1000
         return all_matches, timing
 
@@ -815,8 +843,8 @@ class LinemodMatcher:
 
         t0 = time.perf_counter()
         rmaps_c = _compute_response_maps(s_c)
-        rmaps_c_int32 = [r.astype(np.int32) for r in rmaps_c]
-        del rmaps_c, s_c, q_c  # free uint8 coarse arrays; int32 copies are kept
+        rmaps_c_int16 = [r.astype(np.int16) for r in rmaps_c]
+        del rmaps_c, s_c, q_c  # free uint8 coarse arrays; int16 copies halve memory bandwidth
         timing['coarse_response_maps_ms'] = (time.perf_counter() - t0) * 1000
 
         # Lower threshold for coarse pass — be generous to not miss candidates.
@@ -830,8 +858,7 @@ class LinemodMatcher:
                 continue
 
             templ_c = tp['templates'][coarse_level]
-            n_feats = len(templ_c.features)
-            if n_feats == 0:
+            if templ_c.feat_xs_arr is None or len(templ_c.feat_xs_arr) == 0:
                 continue
 
             tw_c = templ_c.width
@@ -841,31 +868,32 @@ class LinemodMatcher:
             if vy_c <= 0 or vx_c <= 0:
                 continue
 
-            # Score at coarse level using 48 evenly-spaced features.
-            # Coarse only needs to find approximate position (±4px at L2);
-            # the fine pass uses ALL features for precise scoring.
-            score_map = np.zeros((vy_c, vx_c), dtype=np.int32)
-            valid = 0
-
-            n_feats_c = len(templ_c.features)
+            # Use first COARSE_NUM_FEATURES features (highest gradient magnitude)
+            # via cached numpy arrays for vectorized bounds + label-grouped loop.
             max_coarse_feats = cfg.COARSE_NUM_FEATURES
-            if n_feats_c > max_coarse_feats:
-                step = max(1, n_feats_c // max_coarse_feats)
-                coarse_feats = templ_c.features[::step][:max_coarse_feats]
-            else:
-                coarse_feats = templ_c.features
+            xs_a = templ_c.feat_xs_arr[:max_coarse_feats]
+            ys_a = templ_c.feat_ys_arr[:max_coarse_feats]
+            ls_a = templ_c.feat_labels_arr[:max_coarse_feats]
 
-            for feat in coarse_feats:
-                fx, fy = feat.x, feat.y
-                if fy + vy_c <= sh_c and fx + vx_c <= sw_c and fy >= 0 and fx >= 0:
-                    score_map += rmaps_c_int32[feat.label][fy:fy+vy_c, fx:fx+vx_c]
-                    valid += 1
+            valid_mask = (ys_a + vy_c <= sh_c) & (xs_a + vx_c <= sw_c) & (ys_a >= 0) & (xs_a >= 0)
+            valid_xs = xs_a[valid_mask].tolist()
+            valid_ys = ys_a[valid_mask].tolist()
+            valid_ls = ls_a[valid_mask].tolist()
+            valid = len(valid_xs)
 
             if valid == 0:
-                del score_map
                 continue
 
-            sim_map = (score_map * np.float32(100.0)) / np.float32(4 * valid)
+            # int16 score_map: max = 32 feats × 4 = 128 < 32767
+            score_map = np.zeros((vy_c, vx_c), dtype=np.int16)
+
+            # Label-grouped inner loop for better L2 cache utilisation
+            order = np.argsort(valid_ls)
+            for i in order:
+                label, fy, fx = valid_ls[i], valid_ys[i], valid_xs[i]
+                score_map += rmaps_c_int16[label][fy:fy+vy_c, fx:fx+vx_c]
+
+            sim_map = (score_map.astype(np.float32) * np.float32(100.0)) / np.float32(4 * valid)
             del score_map
             ys, xs = np.where(sim_map > coarse_threshold)
             if len(xs) == 0:
@@ -911,15 +939,13 @@ class LinemodMatcher:
                     break
 
         timing['coarse_scoring_ms'] = (time.perf_counter() - t0) * 1000
-        del rmaps_c_int32  # coarse scoring done; free the 8 int32 coarse response maps
+        del rmaps_c_int16  # coarse scoring done; free the 8 int16 coarse response maps
 
-        # Limit fine-search work: keep only the top-N coarse candidates by
-        # score so we don't run the full fine pass on hundreds of duplicates.
-        # 30 is generous — clusters at the same position are merged so the
-        # actual number of fine ROI evaluations is much smaller.
-        if len(coarse_candidates) > 30:
+        # Cap to MAX_FINE_CANDIDATES before clustering so the fine super-ROI
+        # stays small. The correct angle/scale is reliably in the top-N.
+        if len(coarse_candidates) > cfg.MAX_FINE_CANDIDATES:
             coarse_candidates.sort(key=lambda c: c[3], reverse=True)
-            coarse_candidates = coarse_candidates[:30]
+            coarse_candidates = coarse_candidates[:cfg.MAX_FINE_CANDIDATES]
 
         t_coarse = (time.perf_counter() - t0_coarse_total) * 1000
         print(f"  [Pyramid] Coarse (L{coarse_level} {sw_c}×{sh_c}): {len(coarse_candidates)} candidates in {t_coarse:.0f}ms")
@@ -1001,8 +1027,8 @@ class LinemodMatcher:
 
             _t = time.perf_counter()
             rmaps_super = _compute_response_maps(s_super)
-            rmaps_super_int32 = [r.astype(np.int32) for r in rmaps_super]
-            del rmaps_super, s_super, q_super  # free uint8 fine-ROI arrays
+            rmaps_super_int16 = [r.astype(np.int16) for r in rmaps_super]
+            del rmaps_super, s_super, q_super  # free uint8 fine-ROI arrays; int16 halves bandwidth
             t_fine_rmap += (time.perf_counter() - _t) * 1000
 
             for cand in cluster['candidates']:
@@ -1023,20 +1049,30 @@ class LinemodMatcher:
                     t_fine_score += (time.perf_counter() - _t) * 1000
                     continue
 
-                score_map = np.zeros((vy, vx), dtype=np.int32)
-                valid = 0
-                for feat in templ0.features:
-                    fx, fy = feat.x, feat.y
-                    if fy + vy <= rh and fx + vx <= rw and fy >= 0 and fx >= 0:
-                        score_map += rmaps_super_int32[feat.label][ly+fy:ly+fy+vy, lx+fx:lx+fx+vx]
-                        valid += 1
+                # Vectorized bounds check using cached numpy arrays
+                xs_a = templ0.feat_xs_arr
+                ys_a = templ0.feat_ys_arr
+                ls_a = templ0.feat_labels_arr
+                valid_mask = (ys_a + vy <= rh) & (xs_a + vx <= rw) & (ys_a >= 0) & (xs_a >= 0)
+                valid_xs = xs_a[valid_mask].tolist()
+                valid_ys = ys_a[valid_mask].tolist()
+                valid_ls = ls_a[valid_mask].tolist()
+                valid = len(valid_xs)
 
                 if valid == 0:
-                    del score_map
                     t_fine_score += (time.perf_counter() - _t) * 1000
                     continue
 
-                sim_map = (score_map * np.float32(100.0)) / np.float32(4 * valid)
+                # int16 score_map: max = 128 feats × 4 = 512 < 32767
+                score_map = np.zeros((vy, vx), dtype=np.int16)
+
+                # Label-grouped inner loop for better L2 cache utilisation
+                order = np.argsort(valid_ls)
+                for i in order:
+                    label, fy, fx = valid_ls[i], valid_ys[i], valid_xs[i]
+                    score_map += rmaps_super_int16[label][ly+fy:ly+fy+vy, lx+fx:lx+fx+vx]
+
+                sim_map = (score_map.astype(np.float32) * np.float32(100.0)) / np.float32(4 * valid)
                 del score_map
                 ys, xs = np.where(sim_map > threshold)
 
@@ -1050,11 +1086,22 @@ class LinemodMatcher:
 
                 nms_dist_sq = cfg.NMS_DISTANCE ** 2
                 kept = []
+                scale = tp['scale']
+
+                # Scale-aware position correction (same logic as _match_single_level)
+                if abs(scale - 1.0) > 0.01 and templ0.feat_xs_arr is not None and len(templ0.feat_xs_arr) > 0:
+                    mean_cfx = float(np.mean(templ0.feat_xs_arr)) + templ0.tl_x
+                    mean_cfy = float(np.mean(templ0.feat_ys_arr)) + templ0.tl_y
+                    scale_corr_x = (scale - 1.0) / scale * (mean_cfx - img_w // 2)
+                    scale_corr_y = (scale - 1.0) / scale * (mean_cfy - img_h // 2)
+                else:
+                    scale_corr_x = scale_corr_y = 0.0
+
                 for idx in order:
                     r_i, c_i = int(ys[idx]), int(xs[idx])
                     dx, dy = _subpixel_refine(sim_map, r_i, c_i)
-                    cx = c_i + dx + rx - templ0.tl_x + img_w // 2
-                    cy = r_i + dy + ry - templ0.tl_y + img_h // 2
+                    cx = c_i + dx + rx - templ0.tl_x + img_w // 2 + scale_corr_x
+                    cy = r_i + dy + ry - templ0.tl_y + img_h // 2 + scale_corr_y
                     s = float(scores[idx])
 
                     dup = False
@@ -1081,7 +1128,7 @@ class LinemodMatcher:
                 t_fine_score += (time.perf_counter() - _t) * 1000
                 all_matches.extend(kept)
 
-            del rmaps_super_int32  # free int32 fine-ROI maps after all candidates in cluster
+            del rmaps_super_int16  # free int16 fine-ROI maps after all candidates in cluster
 
         t_fine = (time.perf_counter() - t0_fine_total) * 1000
         print(f"  [Pyramid] Fine   (L0 {sw}×{sh}): {len(all_matches)} matches in {t_fine:.0f}ms")
@@ -1099,6 +1146,78 @@ class LinemodMatcher:
             'scoring_ms':       timing.get('coarse_scoring_ms', 0)  + t_fine_score,
         })
         return all_matches, timing
+
+    def _angular_interpolate(self, matches: list) -> dict:
+        """
+        Parabolic sub-pixel interpolation on the angle axis.
+
+        The response-map score landscape is smooth across rotation angle.
+        Given the best discrete-angle match and scores from the immediately
+        neighbouring angle templates at (approximately) the same spatial
+        position, a 3-point parabolic fit yields a refined angle between the
+        discrete template steps:
+
+            delta = (ANGLE_STEP / 2) * (S_prev - S_next)
+                    / (S_prev - 2*S_best + S_next)
+
+        The delta is clamped to ±ANGLE_STEP/2 so the result never jumps to
+        a different template's territory.  Angles are wrapped modulo 360°.
+
+        The x/y position and score of the best discrete match are intentionally
+        kept unchanged — only `angle` and `angle_interp_delta` are updated.
+        """
+        best = matches[0]
+        best_angle  = best['angle']
+        best_score  = best['score']
+        angle_step  = self.config.ANGLE_STEP
+        nms_dist_sq = self.config.NMS_DISTANCE ** 2
+
+        # Angles of the two immediate neighbours (wrap around 360°)
+        prev_angle = (best_angle - angle_step) % 360.0
+        next_angle = (best_angle + angle_step) % 360.0
+
+        s_prev = s_next = None
+
+        for m in matches[1:]:
+            if abs(m['angle'] - prev_angle) < 1e-3:
+                # Must be at roughly the same spatial position
+                if (m['x'] - best['x'])**2 + (m['y'] - best['y'])**2 < nms_dist_sq:
+                    if s_prev is None:
+                        s_prev = m['score']
+            elif abs(m['angle'] - next_angle) < 1e-3:
+                if (m['x'] - best['x'])**2 + (m['y'] - best['y'])**2 < nms_dist_sq:
+                    if s_next is None:
+                        s_next = m['score']
+            if s_prev is not None and s_next is not None:
+                break
+
+        # If one or both neighbours weren't found in fine pass results,
+        # use score=0 as a last resort (asymmetric parabola still helps).
+        if s_prev is None:
+            s_prev = 0.0
+        if s_next is None:
+            s_next = 0.0
+
+        # Parabolic fit — denominator guard against flat plateau
+        denom = s_prev - 2.0 * best_score + s_next
+        if abs(denom) > 1e-6:
+            delta = (angle_step / 2.0) * (s_prev - s_next) / denom
+            # Clamp to ±half_step so we never cross into a neighbouring
+            # template's territory
+            half = angle_step / 2.0
+            delta = max(-half, min(half, delta))
+        else:
+            # Score plateau: no useful interpolation possible
+            delta = 0.0
+
+        refined_angle = (best_angle + delta) % 360.0
+
+        # Return a copy of the best match with the refined angle
+        result = dict(best)
+        result['angle']              = refined_angle
+        result['angle_discrete']     = best_angle   # original grid angle kept for reference
+        result['angle_interp_delta'] = delta
+        return result
 
     def _nms(self, matches):
         """Non-maximum suppression by distance."""
