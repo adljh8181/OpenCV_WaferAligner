@@ -12,8 +12,8 @@ Author: Auto-generated for Wafer Alignment System
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
+# scipy replaced by the pure-numpy implementations in fov_classifier
+from app.services.fov_classifier import find_peaks, gaussian_filter1d
 import random
 import os
 

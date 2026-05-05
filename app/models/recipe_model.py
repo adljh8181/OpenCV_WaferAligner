@@ -63,6 +63,11 @@ DEFAULT_FIND_PATTERN = {
     "DetectionMaskPath": "",
 }
 
+DEFAULT_AUTOFOCUS = {
+    "PeakHeightThresholdPercentage": "0.05",
+    "PeakFilterHalfSize":            "2",
+}
+
 
 # ---------------------------------------------------------------------------
 # RecipeManager — XML read/write helpers
@@ -91,7 +96,8 @@ class RecipeManager:
         return items
 
     def create_recipe(self, folder: str, name: str, edge_params: dict = None,
-                      pattern_params: dict = None) -> str:
+                      pattern_params: dict = None,
+                      autofocus_params: dict = None) -> str:
         """Create a new XML recipe file. Returns the file path."""
         if not name.lower().endswith(".xml"):
             name += ".xml"
@@ -99,6 +105,7 @@ class RecipeManager:
 
         edge   = {**DEFAULT_FIND_EDGE,    **(edge_params    or {})}
         patter = {**DEFAULT_FIND_PATTERN, **(pattern_params or {})}
+        af     = {**DEFAULT_AUTOFOCUS,    **(autofocus_params or {})}
 
         root = ET.Element("Recipe", name=os.path.splitext(name)[0], version="1.0")
 
@@ -116,6 +123,10 @@ class RecipeManager:
         patt_el = ET.SubElement(root, "FindPattern")
         for k, v in patter.items():
             ET.SubElement(patt_el, k).text = str(v)
+
+        af_el = ET.SubElement(root, "AutoFocus")
+        for k, v in af.items():
+            ET.SubElement(af_el, k).text = str(v)
 
         self._write_pretty(root, path)
         return path
@@ -197,6 +208,7 @@ class RecipeManager:
                         d_params[k] = _get("FindWaferEdge", k, v_def)
             edge_params[dir_name] = d_params
         patt_params = {k: _get("FindPattern",   k, v) for k, v in DEFAULT_FIND_PATTERN.items()}
+        af_params   = {k: _get("AutoFocus",      k, v) for k, v in DEFAULT_AUTOFOCUS.items()}
 
         univ_el = root.find("FindWaferEdge/UseUniversalParams")
         use_univ = (univ_el.text.lower() == 'true') if univ_el is not None and univ_el.text else False
@@ -207,6 +219,7 @@ class RecipeManager:
             "meta":         {"created_at": created, "description": desc},
             "find_edge":    edge_params,
             "find_pattern": patt_params,
+            "autofocus":    af_params,
             "use_universal_edge_params": use_univ,
         }
 
@@ -234,6 +247,10 @@ class RecipeManager:
         patt_el = ET.SubElement(root, "FindPattern")
         for k, v in recipe.get("find_pattern", DEFAULT_FIND_PATTERN).items():
             ET.SubElement(patt_el, k).text = str(v)
+
+        af_el = ET.SubElement(root, "AutoFocus")
+        for k, v in recipe.get("autofocus", DEFAULT_AUTOFOCUS).items():
+            ET.SubElement(af_el, k).text = str(v)
 
         self._write_pretty(root, path)
 

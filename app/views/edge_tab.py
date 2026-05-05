@@ -388,6 +388,22 @@ class EdgeTab:
             self.edge_ax2.set_ylabel("Gradient Magnitude")
             self.edge_ax2.grid(True, alpha=0.3)
             self.edge_ax2.legend(loc='upper right', fontsize=8)
+            # Scale Y-axis to gradient data so peaks are always visible,
+            # regardless of how high the threshold line is set.
+            grad_max = abs_gradient_1d.max() if abs_gradient_1d.max() > 0 else 1
+            y_top = max(grad_max * 1.4, cfg.EDGE_THRESHOLD * 1.1)
+            # If threshold is more than 5x the gradient peak, clamp to gradient
+            # range and annotate the threshold value as text instead.
+            if cfg.EDGE_THRESHOLD > grad_max * 5:
+                y_top = grad_max * 1.4
+                self.edge_ax2.lines[-1].set_visible(False)   # hide axhline
+                self.edge_ax2.texts and [t.remove() for t in self.edge_ax2.texts]
+                self.edge_ax2.text(0.98, 0.97,
+                                   f'Threshold = {cfg.EDGE_THRESHOLD} (above range)',
+                                   transform=self.edge_ax2.transAxes,
+                                   color='orange', fontsize=7,
+                                   ha='right', va='top')
+            self.edge_ax2.set_ylim(0, y_top)
             self.edge_fig.tight_layout(pad=2.0)
             self.edge_canvas.draw()
 

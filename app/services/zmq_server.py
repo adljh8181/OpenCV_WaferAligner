@@ -85,6 +85,7 @@ Usage:
 
 import argparse
 import json
+import math
 import re
 import os
 import sys
@@ -142,9 +143,11 @@ class WaferAlignmentServer:
         self.edge_configs = {}
         self._last_recipe_path = None   # cache: skip generate_templates if unchanged
         # Autofocus session state (START_AUTOFOCUS_REQ / FOCUS_REQ)
-        self._af_heights    = []    # list[float]  Z heights collected so far
-        self._af_fmis       = []    # list[float]  FMI scores collected so far
-        self._af_step_count = 50    # total steps set by START_AUTOFOCUS_REQ
+        self._af_heights          = []    # list[float]  Z heights collected so far
+        self._af_fmis             = []    # list[float]  FMI scores collected so far
+        self._af_step_count       = 50    # total steps set by START_AUTOFOCUS_REQ
+        self._af_peak_threshold   = 0.05  # PeakHeightThresholdPercentage from recipe
+        self._af_peak_half_size   = 2     # PeakFilterHalfSize from recipe
 
         # ZMQ setup
         self.context = zmq.Context()
@@ -229,8 +232,8 @@ class WaferAlignmentServer:
         except KeyboardInterrupt:
             self._log("\n[SERVER] Interrupted by user.")
         finally:
-            self.socket.close()
-            self.context.term()
+            self.socket.close(linger=0)
+            self.context.destroy(linger=0)
 
     # ------------------------------------------------------------------
     # Internal dispatcher
@@ -606,7 +609,11 @@ class WaferAlignmentServer:
             return f"FOCUS_OK {fmi:.3f} UP"
 
         # Enough steps — run sliding-window peak detection
-        peaks = self._peak_detection(self._af_fmis)
+        peaks = self._peak_detection(
+            self._af_fmis,
+            window_half_size=self._af_peak_half_size,
+            threshold_perc=self._af_peak_threshold,
+        )
         if peaks:
             best_idx    = peaks[0]          # first (bottom-most) peak, mirrors C# peaks[0]
             best_height = self._af_heights[best_idx]
@@ -722,14 +729,21 @@ class WaferAlignmentServer:
                                pix_res: float) -> str:
         """
         Handle WAFER_NOTCH_REQ.
-        Matches C# Process_FindWaferNotchEdge(imagePath, side, posX, posY, pixRes).
+        Mirrors C# Process_FindWaferNotchEdge() → InspectNotchOffset() → WNPTOP_REQ().
 
-        Input validation mirrors C# (file-exists and pixRes > 0 checks).
-        The inner InspectNotchOffset() logic has no Python equivalent yet.
+        Pipeline (Top notch, side=0):
+          1. EdgeBinarization: Gaussian blur → Binary threshold → Morph close → Canny
+          2. HoughLinesP to detect line segments
+          3. Classify: |angle| < 5° = vertical edge, |angle| > 10° = slanted notch edge
+          4. Intersect the two lines via Cramer's Rule → notch tip in pixels
+          5. Pixel offset from image centre × pixRes → real-world mm offset
 
         Command:  WAFER_NOTCH_REQ "<imagePath>" <side> <posX> <posY> <pixRes>
         Reply OK: "WAFER_NOTCH_OK <offsetX> <offsetY>"
         Reply ERR:"ERR ImageNotFound" | "ERR Invalid Pixel Resolution" | "WAFER_NOTCH_ERR ..."
+
+        Note: side=1 (Bottom / WNPBOTTOM_REQ) is not implemented — mirrors C# stub.
+        Note: posX / posY are accepted but not used (mirrors C# behaviour).
         """
         if not os.path.isfile(image_path):
             self._log(f"[WAFER_NOTCH] Image not found: {image_path}")
@@ -738,10 +752,285 @@ class WaferAlignmentServer:
             self._log("[WAFER_NOTCH] Invalid pixel resolution.")
             return "ERR Invalid Pixel Resolution"
 
-        # TODO: implement InspectNotchOffset equivalent
-        self._log(f"[WAFER_NOTCH] Not yet implemented. "
-                  f"side={side} pos=({pos_x},{pos_y}) res={pix_res}")
-        return "WAFER_NOTCH_ERR Not yet implemented"
+        # side=1 (Bottom) mirrors C# WNPBOTTOM_REQ which is a stub returning false
+        if side == 1:
+            self._log("[WAFER_NOTCH] Bottom notch (side=1) not yet implemented (mirrors C# stub).")
+            return "WAFER_NOTCH_ERR Bottom notch not implemented"
+
+        try:
+            # ── Load grayscale image ──────────────────────────────────────────
+            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                return "ERR ImageNotFound"
+
+            h, w = img.shape[:2]
+
+            # ── Read threshold from recipe (WaferTopEdgeThreshold, default=150) ──
+            threshold = 150
+            if self._last_recipe_path:
+                try:
+                    r = self.recipe_mgr.load(self._last_recipe_path)
+                    notch_cfg = r.get("notch", {})
+                    threshold = int(notch_cfg.get("WaferTopEdgeThreshold", 150))
+                except Exception:
+                    pass
+
+            # ── Step 1a: Gaussian Blur ────────────────────────────────────────
+            k_blur = int(0.03 * w)
+            if k_blur % 2 == 0:
+                k_blur += 1
+            k_blur = max(k_blur, 3)
+            blurred = cv2.GaussianBlur(img, (k_blur, k_blur), 0)
+
+            # ── Step 1b: Binary threshold ─────────────────────────────────────
+            _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY)
+
+            # ── Step 1c: Morphological Close ──────────────────────────────────
+            k_morph = max(int(0.048 * w), 1)
+            struct_elem = cv2.getStructuringElement(cv2.MORPH_RECT, (k_morph, k_morph))
+            morphed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, struct_elem, iterations=1)
+
+            # ── Step 1d: Canny edge detection ─────────────────────────────────
+            edges = cv2.Canny(morphed, threshold1=30, threshold2=10)
+
+            # ── Step 2: Hough Line Detection ──────────────────────────────────
+            lines = cv2.HoughLinesP(
+                edges,
+                rho=1,
+                theta=math.pi / 180.0,
+                threshold=50,
+                minLineLength=50,
+                maxLineGap=10
+            )
+            if lines is None:
+                self._log("[WAFER_NOTCH] No lines detected by HoughLinesP.")
+                self._show_notch_pipeline(img, blurred, binary, morphed, edges,
+                                          None, None, None, None,
+                                          threshold, k_blur, k_morph)
+                return "WAFER_NOTCH_ERR No lines detected"
+
+            # ── Step 3: Line Classification ────────────────────────────────────
+            vertical_line = None   # |angle| < 5°  — straight wafer edge
+            slanted_line  = None   # |angle| > 10° — notch diagonal
+
+            for seg in lines:
+                x1, y1, x2, y2 = seg[0]
+                angle     = math.degrees(math.atan2(y2 - y1, x2 - x1))
+                abs_angle = abs(angle)
+                if abs_angle < 5.0:
+                    vertical_line = (x1, y1, x2, y2)
+                elif abs_angle > 10.0:
+                    slanted_line  = (x1, y1, x2, y2)
+
+            if vertical_line is None or slanted_line is None:
+                self._log(f"[WAFER_NOTCH] Line classification failed — "
+                          f"vertical={vertical_line is not None}  "
+                          f"slanted={slanted_line is not None}")
+                self._show_notch_pipeline(img, blurred, binary, morphed, edges,
+                                          lines, vertical_line, slanted_line, None,
+                                          threshold, k_blur, k_morph)
+                return "WAFER_NOTCH_ERR Could not classify edge lines"
+
+            # ── Step 4: Intersection via Cramer's Rule ─────────────────────────
+            def line_abc(x1, y1, x2, y2):
+                A = float(y2 - y1)
+                B = float(x1 - x2)
+                C = A * x1 + B * y1
+                return A, B, C
+
+            A1, B1, C1 = line_abc(*vertical_line)
+            A2, B2, C2 = line_abc(*slanted_line)
+
+            det = A1 * B2 - A2 * B1
+            if abs(det) < 1e-10:
+                self._log("[WAFER_NOTCH] Lines are parallel — cannot compute intersection.")
+                self._show_notch_pipeline(img, blurred, binary, morphed, edges,
+                                          lines, vertical_line, slanted_line, None,
+                                          threshold, k_blur, k_morph)
+                return "WAFER_NOTCH_ERR Lines are parallel"
+
+            ix = (B2 * C1 - B1 * C2) / det
+            iy = (A1 * C2 - A2 * C1) / det
+
+            # ── Step 5: Pixel offset from image centre ─────────────────────────
+            cx = w / 2.0
+            cy = h / 2.0
+            dx_px = ix - cx
+            dy_px = iy - cy
+
+            # ── Step 6: Convert pixel offset to real-world mm ──────────────────
+            offset_x = dx_px * pix_res
+            offset_y = dy_px * pix_res
+
+            self._log(f"[WAFER_NOTCH] tip=({ix:.1f},{iy:.1f})  "
+                      f"offset_px=({dx_px:.3f},{dy_px:.3f})  "
+                      f"offset_mm=({offset_x:.3f},{offset_y:.3f})")
+
+            # ── Show pipeline visualization ────────────────────────────────────
+            self._show_notch_pipeline(img, blurred, binary, morphed, edges,
+                                      lines, vertical_line, slanted_line,
+                                      (ix, iy, cx, cy, offset_x, offset_y),
+                                      threshold, k_blur, k_morph)
+
+            return f"WAFER_NOTCH_OK {offset_x:.3f} {offset_y:.3f}"
+
+        except Exception as exc:
+            traceback.print_exc()
+            return f"WAFER_NOTCH_ERR {exc}"
+
+    # ------------------------------------------------------------------
+    # Notch pipeline visualizer
+    # ------------------------------------------------------------------
+    def _show_notch_pipeline(self, img, blurred, binary, morphed, edges,
+                             lines, vertical_line, slanted_line, result_info,
+                             threshold, k_blur, k_morph):
+        """
+        Builds and displays a 3×2 tiled pipeline visualization window showing
+        every intermediate stage of WAFER_NOTCH_REQ processing.
+
+        Tiles (left→right, top→bottom):
+          [0] Original grayscale
+          [1] Gaussian blurred
+          [2] Binary threshold
+          [3] Morphological close
+          [4] Canny edges  +  all Hough lines (cyan)
+          [5] Result overlay: vertical(green) / slanted(yellow) / tip(red) / offset(magenta)
+
+        Press any key on the window to dismiss it.
+        """
+        TILE_W, TILE_H = 640, 480
+        FONT  = cv2.FONT_HERSHEY_SIMPLEX
+        FS    = 0.55
+        FT    = 1
+        PAD   = 6
+
+        def to_bgr(gray):
+            if len(gray.shape) == 2:
+                return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            return gray.copy()
+
+        def make_tile(src_gray, title, annotations=None):
+            """Resize to TILE_W×TILE_H, convert to BGR, draw title + annotations."""
+            tile = cv2.resize(src_gray, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
+            tile = to_bgr(tile)
+
+            # Scale factor original→tile
+            oh, ow = src_gray.shape[:2]
+            sx = TILE_W / ow
+            sy = TILE_H / oh
+
+            if annotations:
+                for ann in annotations:
+                    ann(tile, sx, sy)
+
+            # Dark bar at top for title
+            cv2.rectangle(tile, (0, 0), (TILE_W, 22), (30, 30, 30), -1)
+            cv2.putText(tile, title, (PAD, 16), FONT, FS, (220, 220, 220), FT, cv2.LINE_AA)
+            return tile
+
+        # ── Tile 0 — Original ──────────────────────────────────────────────
+        t0 = make_tile(img, f"[1] Original  ({img.shape[1]}x{img.shape[0]})")
+
+        # ── Tile 1 — Blurred ──────────────────────────────────────────────
+        t1 = make_tile(blurred, f"[2] Gaussian Blur  k={k_blur}")
+
+        # ── Tile 2 — Binary ───────────────────────────────────────────────
+        t2 = make_tile(binary, f"[3] Binary Threshold  thr={threshold}")
+
+        # ── Tile 3 — Morphed ──────────────────────────────────────────────
+        t3 = make_tile(morphed, f"[4] Morph Close  k={k_morph}")
+
+        # ── Tile 4 — Canny + all Hough lines ──────────────────────────────
+        def draw_all_lines(tile, sx, sy):
+            if lines is not None:
+                for seg in lines:
+                    x1, y1, x2, y2 = seg[0]
+                    cv2.line(tile,
+                             (int(x1 * sx), int(y1 * sy)),
+                             (int(x2 * sx), int(y2 * sy)),
+                             (255, 255, 0), 1, cv2.LINE_AA)   # cyan
+
+        n_lines = 0 if lines is None else len(lines)
+        t4 = make_tile(edges, f"[5] Canny + Hough  ({n_lines} lines)", [draw_all_lines])
+
+        # ── Tile 5 — Result overlay ────────────────────────────────────────
+        def draw_result(tile, sx, sy):
+            # All detected Hough lines (dim cyan)
+            if lines is not None:
+                for seg in lines:
+                    x1, y1, x2, y2 = seg[0]
+                    cv2.line(tile,
+                             (int(x1 * sx), int(y1 * sy)),
+                             (int(x2 * sx), int(y2 * sy)),
+                             (80, 80, 0), 1)
+
+            # Classified vertical line (green)
+            if vertical_line:
+                x1, y1, x2, y2 = vertical_line
+                cv2.line(tile,
+                         (int(x1 * sx), int(y1 * sy)),
+                         (int(x2 * sx), int(y2 * sy)),
+                         (0, 230, 0), 2, cv2.LINE_AA)
+                cv2.putText(tile, "vertical", (int(x1 * sx) + 4, int(y1 * sy) - 6),
+                            FONT, 0.42, (0, 230, 0), 1, cv2.LINE_AA)
+
+            # Classified slanted line (yellow)
+            if slanted_line:
+                x1, y1, x2, y2 = slanted_line
+                cv2.line(tile,
+                         (int(x1 * sx), int(y1 * sy)),
+                         (int(x2 * sx), int(y2 * sy)),
+                         (0, 220, 220), 2, cv2.LINE_AA)
+                cv2.putText(tile, "slanted", (int(x1 * sx) + 4, int(y1 * sy) - 6),
+                            FONT, 0.42, (0, 220, 220), 1, cv2.LINE_AA)
+
+            if result_info:
+                ix, iy, cx, cy, offset_x, offset_y = result_info
+                tip_x, tip_y   = int(ix * sx), int(iy * sy)
+                ctr_x, ctr_y   = int(cx * sx), int(cy * sy)
+
+                # Centre crosshair (white)
+                cv2.drawMarker(tile, (ctr_x, ctr_y), (200, 200, 200),
+                               cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
+
+                # Offset line centre → tip (magenta dashed via polyline)
+                cv2.arrowedLine(tile, (ctr_x, ctr_y), (tip_x, tip_y),
+                                (220, 0, 220), 2, cv2.LINE_AA, tipLength=0.08)
+
+                # Notch tip (red filled circle)
+                cv2.circle(tile, (tip_x, tip_y), 7, (0, 0, 255), -1)
+                cv2.circle(tile, (tip_x, tip_y), 7, (255, 255, 255), 1)
+
+                # Result text
+                label1 = f"tip px  ({ix:.1f}, {iy:.1f})"
+                label2 = f"offset  ({offset_x:.3f}, {offset_y:.3f}) mm"
+                cv2.putText(tile, label1, (PAD, TILE_H - 28),
+                            FONT, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(tile, label2, (PAD, TILE_H - 10),
+                            FONT, 0.48, (100, 255, 100), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(tile, "FAILED", (TILE_W // 2 - 50, TILE_H // 2),
+                            FONT, 1.2, (0, 0, 255), 2, cv2.LINE_AA)
+
+        t5 = make_tile(img, "[6] Result Overlay", [draw_result])
+
+        # ── Assemble 3×2 grid ─────────────────────────────────────────────
+        row0 = cv2.hconcat([t0, t1, t2])
+        row1 = cv2.hconcat([t3, t4, t5])
+        grid = cv2.vconcat([row0, row1])
+
+        # Header bar
+        header = cv2.copyMakeBorder(grid, 32, 0, 0, 0,
+                                    cv2.BORDER_CONSTANT, value=(20, 20, 20))
+        status = "OK" if result_info else "FAILED"
+        color  = (80, 255, 80) if result_info else (60, 60, 255)
+        cv2.putText(header,
+                    f"WAFER_NOTCH_REQ Pipeline  |  side=Top  |  status={status}",
+                    (PAD, 22), FONT, 0.7, color, 1, cv2.LINE_AA)
+
+        cv2.imshow("WAFER_NOTCH_REQ — Pipeline", header)
+        cv2.waitKey(0)
+        cv2.destroyWindow("WAFER_NOTCH_REQ — Pipeline")
 
     def _find_wafer_template(self,
                              image_path: str,
@@ -1075,7 +1364,14 @@ class WaferAlignmentServer:
             # 2. Apply Edge params
             self.edge_configs = r.get("find_edge", {})
 
-            # 3. Load Template Image (+ detection mask if one exists alongside it)
+            # 3. Apply Autofocus params
+            af = r.get("autofocus", {})
+            if "PeakHeightThresholdPercentage" in af:
+                self._af_peak_threshold = float(af["PeakHeightThresholdPercentage"])
+            if "PeakFilterHalfSize" in af:
+                self._af_peak_half_size = int(af["PeakFilterHalfSize"])
+
+            # 4. Load Template Image (+ detection mask if one exists alongside it)
             tpath = fp.get("TemplatePath", "")
             if tpath:
                 if not os.path.isfile(tpath):

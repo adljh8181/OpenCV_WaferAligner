@@ -27,6 +27,9 @@ from app.models.recipe_model import RecipeBrowserDialog, DEFAULT_DIRECTION_PARAM
 from app.views.zmq_tab import ZmqTab
 from app.views.edge_tab import EdgeTab
 from app.views.pattern_tab import PatternTab
+from app.views.autofocus_tab import AutoFocusTab
+from app.views.notch_tab import NotchTab
+from app.views.settings_tab import SettingsTab
 
 
 class WaferAlignerUI:
@@ -107,10 +110,29 @@ class WaferAlignerUI:
             display_cv2_image=self.display_cv2_image,
             log_callback=self._log_status,
         )
+        self.autofocus_tab = AutoFocusTab(
+            recipe_nb, self.state,
+            log_callback=self._log_status,
+        )
+        self.notch_tab = NotchTab(
+            recipe_nb, self.state,
+            display_cv2_image=self.display_cv2_image,
+            log_callback=self._log_status,
+        )
+
+        # ── Settings tab (top-level, beside Recipe) ───────────────────────
+        self.settings_tab = SettingsTab(
+            self.notebook,
+            self.state,
+            on_folder_changed=self._on_recipe_folder_changed,
+            log_callback=self._log_status,
+        )
 
         # Keep references to tab frames for notebook.select()
-        self.tab_edge    = self.edge_tab.tab
-        self.tab_pattern = self.pattern_tab.tab
+        self.tab_edge       = self.edge_tab.tab
+        self.tab_pattern    = self.pattern_tab.tab
+        self.tab_autofocus  = self.autofocus_tab.tab
+        self.tab_notch      = self.notch_tab.tab
 
         # Auto-start the ZMQ server after UI is fully initialized
         self.root.after(500, self.zmq_tab.on_start_server)
@@ -183,6 +205,12 @@ class WaferAlignerUI:
     # ------------------------------------------------------------------
     # Recipe system
     # ------------------------------------------------------------------
+
+    def _on_recipe_folder_changed(self, new_path: str):
+        """Called by SettingsTab when the user applies a new recipe folder."""
+        # recipes_root is already updated on AppState by SettingsTab._apply_folder()
+        # Nothing else to do here — _open_recipe_browser reads from state on demand.
+        pass
 
     def _open_recipe_browser(self):
         dlg  = RecipeBrowserDialog(self.root, self.state.recipe_mgr.recipes_root)
@@ -263,6 +291,17 @@ class WaferAlignerUI:
             pt.lbl_template_img.config(image='')
             pt.template_img_var.set("")
 
+        # ── Autofocus config ─────────────────────────────────────────────
+        af = recipe.get("autofocus", {})
+        aft = self.autofocus_tab
+        if "PeakHeightThresholdPercentage" in af:
+            aft.peak_threshold_var.set(af["PeakHeightThresholdPercentage"])
+        if "PeakFilterHalfSize" in af:
+            aft.peak_half_size_var.set(af["PeakFilterHalfSize"])
+
+        # ── Notch config ─────────────────────────────────────────────────
+        self.notch_tab.load_from_recipe(recipe)
+
         self._log_status(f"Active Recipe: {name}")
 
     def save_all_config(self):
@@ -328,6 +367,13 @@ class WaferAlignerUI:
                     fp["DetectionMaskPath"] = mask_dest
                 else:
                     fp["DetectionMaskPath"] = ""
+
+            af = self.state.current_recipe.setdefault("autofocus", {})
+            aft = self.autofocus_tab
+            af["PeakHeightThresholdPercentage"] = aft.peak_threshold_var.get()
+            af["PeakFilterHalfSize"]            = aft.peak_half_size_var.get()
+
+            self.notch_tab.save_to_recipe(self.state.current_recipe)
 
             self.state.recipe_mgr.save(self.state.current_recipe)
             name = self.state.current_recipe['name']
@@ -494,9 +540,9 @@ class WaferAlignerUI:
 
             self.root.after(100, _do)
 
-    def on_stop_server(self):
+    def on_stop_server(self, completion_callback=None):
         """Called by the window close handler."""
-        self.zmq_tab.on_stop_server()
+        self.zmq_tab.on_stop_server(completion_callback=completion_callback)
 
 
 # ---------------------------------------------------------------------------

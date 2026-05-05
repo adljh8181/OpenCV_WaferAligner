@@ -3,7 +3,6 @@
 # Build with:  pyinstaller WaferAligner_UI.spec
 
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_all
 
 # Bundle any icon / logo files present in the workspace root
 root_datas = []
@@ -16,27 +15,26 @@ recipe_datas = []
 if os.path.isdir('recipes'):
     recipe_datas.append(('recipes', 'recipes'))
 
-# scipy needs collect_all to bundle its compiled C extensions correctly
-scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
+# scipy has been eliminated — find_peaks and gaussian_filter1d are now
+# implemented in pure numpy inside app/services/fov_classifier.py
 
 a = Analysis(
     ['WaferAligner_UI.py'],
     pathex=['.'],
-    binaries=[*scipy_binaries],
+    binaries=[],
     datas=[
         ('app', 'app'),          # entire app package
         ('Images', 'Images'),    # FOV classifier reference images
         *root_datas,
         *recipe_datas,
-        *scipy_datas,
     ],
-    hiddenimports=[*scipy_hiddenimports,
+    hiddenimports=[
         # tkinter and sub-modules
         'tkinter',
         'tkinter.ttk',
         'tkinter.filedialog',
         'tkinter.messagebox',
-        # matplotlib Tk backend
+        # matplotlib Tk backend only
         'matplotlib.backends.backend_tkagg',
         'matplotlib.backends._backend_tk',
         # pystray platform backend (Windows)
@@ -60,20 +58,32 @@ a = Analysis(
         'app.services.zmq_server',
         'app.models.app_state',
         'app.models.recipe_model',
-        # scipy — used by edge_finder for find_peaks
-        'scipy',
-        'scipy.signal',
-        'scipy.signal._peak_finding',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Heavy ML packages not needed at runtime — reduces exe size significantly
-        'torch', 'torchvision', 'onnxruntime',
+        # scipy is no longer used — eliminates ~150 MB of compiled DLLs
+        'scipy',
+        # Heavy ML / data-science packages not used at runtime
+        'torch', 'torchvision', 'torchaudio', 'onnxruntime',
         'langchain', 'chromadb', 'huggingface_hub',
-        'pandas', 'sklearn',
-        'IPython', 'jupyter', 'notebook',
+        'pandas', 'sklearn', 'skimage', 'statsmodels',
+        'IPython', 'jupyter', 'notebook', 'ipykernel', 'ipywidgets',
+        # Unused matplotlib backends (only TkAgg is used)
+        'matplotlib.backends.backend_qt5agg',
+        'matplotlib.backends.backend_qt5',
+        'matplotlib.backends.backend_qtagg',
+        'matplotlib.backends.backend_pdf',
+        'matplotlib.backends.backend_svg',
+        'matplotlib.backends.backend_ps',
+        'matplotlib.backends.backend_wx',
+        'matplotlib.backends.backend_wxagg',
+        'matplotlib.backends.backend_cairo',
+        'matplotlib.backends.backend_webagg',
+        'matplotlib.backends.backend_nbagg',
+        'matplotlib.backends.backend_gtk3agg',
+        'matplotlib.backends.backend_gtk4agg',
     ],
     noarchive=False,
     optimize=1,
@@ -81,22 +91,33 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# onedir mode: EXE is just a small launcher (~1 MB).
+# All DLLs and data sit in the dist\WaferAlignerUI\ folder beside it.
+# Zip that folder to distribute.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,   # binaries go into COLLECT, not embedded in EXE
     name='WaferAlignerUI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=['vcruntime*.dll', 'msvcp*.dll', 'python*.dll'],
-    runtime_tmpdir=None,
-    console=False,           # No black console window (GUI app)
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     icon='QES.ico' if os.path.exists('QES.ico') else None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=['vcruntime*.dll', 'msvcp*.dll', 'python*.dll'],
+    name='WaferAlignerUI',
 )

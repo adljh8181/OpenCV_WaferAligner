@@ -5,12 +5,43 @@ All implementation has moved into the app/ package.
 This file simply launches the application.
 """
 import os
+import sys
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from PIL import Image
 import pystray
 from app.views.main_window import WaferAlignerUI
+
+# ── Single-instance guard (Windows named mutex) ───────────────────────────────
+_MUTEX_NAME = "Global\\VPServer_WaferAlignerUI_SingleInstance"
+
+def _check_single_instance():
+    """
+    Creates a named mutex. Returns the mutex handle on success.
+    If another instance already holds the mutex, shows a warning and exits.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    ERROR_ALREADY_EXISTS = 183
+
+    handle = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        # Need a minimal Tk root just to show the messagebox
+        _root = tk.Tk()
+        _root.withdraw()
+        messagebox.showerror(
+            "Application Already Running",
+            "VPServer – Wafer Alignment UI is already running.\n\n"
+            "If you don't see the window, check the system tray (bottom-right corner "
+            "of your taskbar), right-click the icon, and choose Exit."
+        )
+        _root.destroy()
+        sys.exit(1)
+
+    return handle  # keep alive for the duration of the process
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _cleanup_temp_files():
@@ -25,6 +56,8 @@ def _cleanup_temp_files():
 
 
 def main():
+    _mutex = _check_single_instance()  # exits here if another instance is running
+
     root = tk.Tk()
 
     style = ttk.Style(root)
@@ -48,7 +81,15 @@ def main():
     def on_exit(icon, item):
         icon.stop()
         _cleanup_temp_files()
-        root.after(0, lambda: (app.on_stop_server(), root.destroy()))
+        def _do_exit():
+            def _after_stop():
+                try:
+                    root.quit()
+                    root.destroy()
+                except Exception:
+                    pass
+            app.on_stop_server(completion_callback=_after_stop)
+        root.after(0, _do_exit)
 
     def on_closing():
         nonlocal icon_instance
@@ -81,4 +122,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

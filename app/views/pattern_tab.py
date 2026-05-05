@@ -419,7 +419,7 @@ class PatternTab:
             )
             # _timing_win was already closed in _on_find_pattern before the
             # background thread started; just open the new one here.
-            self._timing_win = self.vm.show_timing_chart(timing)
+            # self._timing_win = self.vm.show_timing_chart(timing)
 
     def _on_show_orientations(self):
         if not self.state.template_loaded:

@@ -119,28 +119,49 @@ class ZmqTab:
             root    = self.tab.winfo_toplevel()
 
             def safe_log(msg):
+                def _do():
+                    try:
+                        root.winfo_exists() and self.log(self.log_status, msg)
+                    except Exception:
+                        pass
                 try:
-                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_status, msg))
-                except RuntimeError:
+                    root.after(0, _do)
+                except Exception:
                     pass
 
             def safe_rx_log(msg):
+                def _do():
+                    try:
+                        root.winfo_exists() and self.log(self.log_rx, msg)
+                    except Exception:
+                        pass
                 try:
-                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_rx, msg))
-                except RuntimeError:
+                    root.after(0, _do)
+                except Exception:
                     pass
 
             def safe_tx_log(msg):
+                def _do():
+                    try:
+                        root.winfo_exists() and self.log(self.log_tx, msg)
+                    except Exception:
+                        pass
                 try:
-                    root.after(0, lambda: root.winfo_exists() and self.log(self.log_tx, msg))
-                except RuntimeError:
+                    root.after(0, _do)
+                except Exception:
                     pass
 
             def safe_ui_sync(payload: dict):
                 if self._ui_sync_callback:
+                    cb = self._ui_sync_callback
+                    def _do():
+                        try:
+                            root.winfo_exists() and cb(payload)
+                        except Exception:
+                            pass
                     try:
-                        root.after(0, lambda: root.winfo_exists() and self._ui_sync_callback(payload))
-                    except RuntimeError:
+                        root.after(0, _do)
+                    except Exception:
                         pass
 
             # Fired from inside server.run() once the poll loop is live
@@ -260,10 +281,14 @@ class ZmqTab:
             if thread_to_join and thread_to_join.is_alive():
                 thread_to_join.join(timeout=3.0)
 
+            def _done():
+                try:
+                    root.winfo_exists() and self.log(self.log_status, "Server stopped and disconnected.")
+                except Exception:
+                    pass
             try:
-                root.after(0, lambda: root.winfo_exists() and self.log(
-                    self.log_status, "Server stopped and disconnected."))
-            except RuntimeError:
+                root.after(0, _done)
+            except Exception:
                 pass
 
         threading.Thread(target=_stop_bg, daemon=True).start()

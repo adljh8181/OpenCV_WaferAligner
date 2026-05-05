@@ -14,8 +14,67 @@ Author: Auto-generated for Wafer Alignment System
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
+# Pure-numpy replacements for scipy.signal.find_peaks and scipy.ndimage.gaussian_filter1d.
+# Eliminates the scipy dependency (~150 MB of compiled DLLs).
+
+def gaussian_filter1d(x, sigma):
+    """1-D Gaussian smoothing (drop-in for scipy.ndimage.gaussian_filter1d)."""
+    radius = int(4.0 * sigma + 0.5)
+    k = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (k / sigma) ** 2)
+    kernel /= kernel.sum()
+    return np.convolve(np.asarray(x, dtype=np.float64), kernel, mode='same')
+
+
+def _peak_prominences(x, peaks):
+    """Compute prominence of each peak (matches scipy definition)."""
+    prominences = np.empty(len(peaks))
+    for i, peak in enumerate(peaks):
+        left_min = x[peak]
+        for j in range(peak - 1, -1, -1):
+            if x[j] < left_min:
+                left_min = x[j]
+            if x[j] >= x[peak]:
+                break
+        right_min = x[peak]
+        for j in range(peak + 1, len(x)):
+            if x[j] < right_min:
+                right_min = x[j]
+            if x[j] >= x[peak]:
+                break
+        prominences[i] = x[peak] - max(left_min, right_min)
+    return prominences
+
+
+def find_peaks(x, height=None, distance=None, prominence=None):
+    """Find local maxima (drop-in for scipy.signal.find_peaks)."""
+    x = np.asarray(x, dtype=np.float64)
+    # All local maxima
+    idx = np.where((x[1:-1] > x[:-2]) & (x[1:-1] > x[2:]))[0] + 1
+    # Height filter
+    if height is not None:
+        idx = idx[x[idx] >= height]
+    # Distance filter — keep the tallest peak within each neighbourhood
+    if distance is not None and len(idx) > 1:
+        keep = np.ones(len(idx), dtype=bool)
+        for i in range(len(idx)):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, len(idx)):
+                if idx[j] - idx[i] < distance:
+                    if x[idx[i]] >= x[idx[j]]:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+                        break
+                else:
+                    break
+        idx = idx[keep]
+    # Prominence filter
+    if prominence is not None and len(idx) > 0:
+        proms = _peak_prominences(x, idx)
+        idx = idx[proms >= prominence]
+    return idx, {}
 import os
 import sys
 
